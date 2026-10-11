@@ -13,7 +13,7 @@
 
 [Install](#install) · [What it shows](#what-it-shows) · [Talking to the coordinator](#talking-to-the-coordinator) · [Keys](#keys-and-mouse) · [FAQ](#faq) · [Contributing](#contributing)
 
-<img src="docs/images/demo.gif" alt="A herdr session with three workspaces. The projects board opens as a popup over it: every project at a glance, a decision answered, a task moved and its message reviewed, a card's menu." width="100%">
+<img src="docs/images/demo.gif" alt="A herdr session with three workspaces. The projects board opens as a popup over it: every project at a glance, a decision answered and a task moved, both reviewed and sent together, a card's menu." width="100%">
 
 <sub>Recorded in herdr, with sample projects.</sub>
 
@@ -91,7 +91,7 @@ Press `m` or right-click a card: everything you can do with it, grouped, with ea
 
 ### Reprioritise, review, then send
 
-<img src="docs/images/review.png" alt="The Pending moves box: one sentence for the Mobile app coordinator, with Enter to send all." width="100%">
+<img src="docs/images/review.png" alt="The Pending changes box: an answer for the Website coordinator and a move for the Mobile app coordinator, each with the sentence it sends, and Enter to send all." width="100%">
 
 In herdr-projects, a task's place in TASKS.md is its priority: coordinators work top to bottom. So a moved task shows in its new place, marked *moved · pending*. Answers and task actions can wait too: press Tab instead of Enter in their box. Gather as many as you like, across projects, then press `P`: each project's changes become one sentence to its coordinator, and Enter sends them all.
 

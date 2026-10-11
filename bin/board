@@ -1039,7 +1039,8 @@ class Board:
             row += 1
             for i, kind, entry in mine:
                 chosen = i == self.review_sel
-                self.put(row, x + 3, f"  {board.pending_line(kind, entry)}".ljust(inner + 2)[:inner + 2],
+                line = board.wrap(board.pending_line(kind, entry), inner - 1, 1)[0]
+                self.put(row, x + 3, f"  {line}" + " " * (inner - board.cells(line)),
                          t.panel_sel | curses.A_BOLD if chosen else t.panel)
                 row += 1
             if not brief:
