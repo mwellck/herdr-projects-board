@@ -122,6 +122,7 @@ class Item:
     age: float | None = None   # seconds since a thread last changed
     stale: bool = False
     moved: str = ""      # a move waiting for you to send ("pending") or for the coordinator to apply ("sent")
+    pending: str = ""    # an action waiting for you to send: done, delegate, drop, answer or message
 
     def shown(self):
         return f"{self.text} · {self.note}" if self.note else self.text
@@ -405,12 +406,12 @@ def rows(items, column, folds):
     return out
 
 
-EMPTY_STATE = {"sections": {}, "columns": [], "order": {}, "moves": []}
+EMPTY_STATE = {"sections": {}, "columns": [], "order": {}, "moves": [], "actions": []}
 SENT_MOVES_EXPIRE = 15 * 60  # a sent move the coordinator has not applied by then stops being shown
 
 
 def load_state(directory):
-    """Folds, the board's own section order and the moves not yet applied, kept between runs."""
+    """Folds, the board's own section order, the moves not yet applied and the actions not yet sent, kept between runs."""
     state = copy_state(EMPTY_STATE)
     try:
         data = json.loads((Path(directory) / "state.json").read_text())
@@ -481,8 +482,9 @@ def is_applied(todo, move):
 
 
 def arrange(project, state, now=None):
-    """The project as the board shows it: its sections in the board's order, then the moves still waiting.
-    Sent moves the coordinator has applied (or that are too old) are dropped from state."""
+    """The project as the board shows it: its sections in the board's order, the moves still waiting, and each
+    pending action marked on its card. Sent moves the coordinator has applied (or that are too old), and actions
+    whose card is gone, are dropped from state."""
     now = now or time.time()
     if project.error:  # nothing loaded: keep its moves for when it loads again
         return project
@@ -498,7 +500,17 @@ def arrange(project, state, now=None):
         if apply_move(todo, move):
             keep.append(move)
     state["moves"] = keep
-    project.columns = dict(project.columns, **{"To do": todo})
+    columns, found = {}, []
+    for col, items in dict(project.columns, **{"To do": todo}).items():
+        columns[col] = []
+        for item in items:
+            action = find_action(state, item)
+            if action:
+                found.append(action)
+                item = replace(item, pending=pending_label(action))
+            columns[col].append(item)
+    state["actions"] = [a for a in state["actions"] if a["project"] != project.slug or any(a is f for f in found)]
+    project.columns = columns
     return project
 
 
@@ -540,7 +552,18 @@ def record_move(state, project, move):
     base_state = copy_state(dict(state, moves=others))
     base = arrange(Project(project.slug, project.name, project.path, dict(project.columns)), base_state)
     state["moves"] = others + ([move] if not is_applied(base.columns["To do"], move) else [])
-    # moves that together put every task back where TASKS.md has it would ask the coordinator for nothing
+    settle_moves(state, project)
+
+
+def cancel_move(state, project, text):
+    """Take back a task's pending move."""
+    state["moves"] = [m for m in state["moves"] if not (m["project"] == project.slug and m["text"] == text
+                                                         and m.get("status", "pending") == "pending")]
+    settle_moves(state, project)
+
+
+def settle_moves(state, project):
+    """Moves that together put every task back where TASKS.md has it would ask the coordinator for nothing."""
     after = arrange(Project(project.slug, project.name, project.path, dict(project.columns)), copy_state(state))
     if task_order(after.columns["To do"]) == task_order(project.columns["To do"]):
         state["moves"] = [m for m in state["moves"] if m["project"] != project.slug or m.get("status") == "sent"]
@@ -566,11 +589,68 @@ def move_sentence(moves):
     return f"{SOURCE} Please reorder TASKS.md: " + "; ".join(f"{n}) {p}" for n, p in enumerate(parts, 1)) + "."
 
 
+# pending actions -------------------------------------------------------------
+# An action waiting to be sent: {"project", "text", "kind", "thread"} name its card, "verb" is empty for an
+# answer or a message, "typed" is the answer, message or note.
+ACTION_LABELS = {"mark as done": "done", "delegate": "delegate", "drop": "drop"}
+
+
+def pending_label(action):
+    """How a pending action reads on its card."""
+    return ACTION_LABELS.get(action.get("verb"), "answer" if action.get("kind") == "decision" else "message")
+
+
+def find_action(state, item):
+    """The action waiting for a card, or None."""
+    return next((a for a in state["actions"] if (a["project"], a["text"], a.get("thread", ""))
+                 == (item.project, item.text, item.thread)), None)
+
+
+def record_action(state, action, queue=True):
+    """A card's new action replaces its earlier one. Done, delegate and drop make the task's pending move moot,
+    so it goes. With queue False the action was sent at once: it only clears what it replaces."""
+    card = (action["project"], action["text"], action.get("thread", ""))
+    state["actions"] = [a for a in state["actions"] if (a["project"], a["text"], a.get("thread", "")) != card]
+    if action.get("verb"):
+        state["moves"] = [m for m in state["moves"] if not (m["project"] == action["project"] and m["text"] == action["text"]
+                                                             and m.get("status", "pending") == "pending")]
+    if queue:
+        state["actions"].append(action)
+
+
+def action_sentence(action):
+    item = Item(action["text"], action.get("kind", "task"), thread=action.get("thread", ""))
+    if action.get("verb"):
+        return task_sentence(action["verb"], item, action.get("typed", ""))
+    return answer_sentence(item, action.get("typed", ""))
+
+
+def batch_sentence(actions, moves):
+    """One sentence for everything waiting for a project: its actions, then its moves. A single change reads
+    exactly as it would sent on its own."""
+    if not actions:
+        return move_sentence(moves)
+    parts = [action_sentence(a) for a in actions] + [move_sentence([m]) for m in moves]
+    if len(parts) == 1:
+        return parts[0]
+    bare = [p[len(SOURCE) + 1:].rstrip(".") for p in parts]
+    return f"{SOURCE} Please go through these in order: " + "; ".join(f"{n}) {p}" for n, p in enumerate(bare, 1)) + "."
+
+
+def pending_line(kind, entry):
+    """One line for an action or a move in the review."""
+    if kind == "move":
+        return f"move · {entry['text']}"
+    typed = entry.get("typed", "")
+    return f"{pending_label(entry)} · {entry['text']}" + (f": {typed}" if typed else "")
+
+
 # actions ---------------------------------------------------------------------
 def actions_for(project, item=None):
     """Menu entries for a card (or for the project when item is None): (label, kind, value, group, key).
     kind: 'link' opens a URL, 'copy' copies text, 'herdr'/'hp' run herdr / herdr-projects with value as args,
-    'task' asks to send the task sentence for verb value (with an optional note), 'answer' asks for text first.
+    'task' asks to send the task sentence for verb value (with an optional note), 'answer' asks for text first,
+    'cancel' takes back the card's pending action (or else its pending move).
     group puts entries under a divider; key is the shortcut shown beside the entry."""
     acts = []
     if item and item.link:
@@ -592,6 +672,8 @@ def actions_for(project, item=None):
                  ("Drop…", "task", "drop", "Talk to the coordinator", "D")]
     if item and item.kind == "task" and item.group and item.group not in NEEDS_GROUPS:
         acts.append(("Move…", "move", None, "Arrange", "␣"))
+    if item and (item.pending or item.moved == "pending"):
+        acts.append((f"Cancel pending: {item.pending or 'move'}", "cancel", None, "Pending", "⌫"))
     if item:
         acts.append(("Copy the text", "copy", item.text, "Copy", ""))
     if item and item.link:

@@ -61,7 +61,7 @@ def steps():
         (1.2, "still:answer"), (0.4, "enter"), (0.0, "wait:Sent"),   # typed text is redrawn letter by letter: no wait
         (0.8, "caption:2"), (0.0, "tab"), (0.4, "tab"),     # Mobile app
         (0.5, "right"), (0.3, "down"), (0.3, "space"), (0.3, "down"), (0.3, "down"), (0.3, "space"),
-        (0.5, "P"), (0.0, "wait:Pending moves"), (1.2, "still:review"), (0.0, "enter"), (0.0, "wait:Sent"),
+        (0.5, "P"), (0.0, "wait:Pending changes"), (1.2, "still:review"), (0.0, "enter"), (0.0, "wait:Sent"),
         (0.8, "caption:3"), (0.0, "4"), (0.5, "m"), (0.0, "wait:TALK TO THE COORDINATOR"), (0.3, "j"), (0.3, "j"),
         (1.2, "still:menu"), (0.6, "esc"), (1.0, ""),   # ends on the board, so the loop never shows an empty herdr
     ]

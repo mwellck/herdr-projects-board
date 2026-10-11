@@ -40,13 +40,16 @@ HELP = [
     ("Arrange To do", ""),
     ("Space", "pick up a task or a section; arrows move it; Space drops it"),
     ("Esc", "while moving: put it back"),
-    ("P", "review the moved tasks, then send them to each coordinator"),
-    ("", "sections are the board's own order; task moves change TASKS.md"),
+    ("", "sections are the board's own order; task moves wait for you to send them"),
     ("Talk to the coordinator (asks before sending)", ""),
     ("a", "answer a decision, or tell it something about the card"),
     ("x", "mark a task done (type to add a note)"),
     ("d", "delegate a task (type to add a note)"),
     ("D", "drop a task (type to add a note)"),
+    ("Enter, Tab", "in the box: send now, or add it to the pending changes"),
+    ("Pending changes (kept between runs)", ""),
+    ("P", "review them, then send each coordinator one message"),
+    ("Backspace", "cancel the card's pending change; in the review, the selected one"),
     ("Board", ""),
     ("t", "open the project's TASKS.md"),
     ("s, ⚙", "settings"),
@@ -213,7 +216,8 @@ class Board:
         self.view, self.layout, self.rowcache = None, {}, {}
         self.theme = None
         self.moving = None    # the task or section picked up, with the state to restore on Esc
-        self.review = None    # the pending-moves review panel: "open", or "discard?" while asking to discard
+        self.review = None    # the pending-changes review panel: "open", or "discard?" while asking to discard
+        self.review_sel = 0   # the change selected in the review
         self.pasting = False  # inside a bracketed paste
         self.results = queue.Queue()  # finished background refreshes, applied by the main loop
         self.loading, self.next_refresh, self.announce = False, 0.0, False
@@ -269,20 +273,21 @@ class Board:
         if not error:
             self.raw, self.loaded = raw, loaded
             listed = {p.slug for p in self.raw}
-            kept = [m for m in self.state["moves"] if m["project"] in listed]
-            if len(kept) != len(self.state["moves"]):  # their project was archived or renamed
-                self.state["moves"] = kept
-                self.save_state()
+            for key in ("moves", "actions"):
+                kept = [m for m in self.state[key] if m["project"] in listed]
+                if len(kept) != len(self.state[key]):  # their project was archived or renamed
+                    self.state[key] = kept
+                    self.save_state()
         slugs = [p.slug for p in self.raw]
         self.tab = slugs.index(tab_slug) + 1 if tab_slug in slugs else min(self.tab, len(self.raw))
         self.rebuild()
 
     def rebuild(self):
         mark = self.remember()
-        moves = len(self.state["moves"])
+        counts = len(self.state["moves"]), len(self.state["actions"])
         self.projects = [board.arrange(board.Project(p.slug, p.name, p.path, dict(p.columns), p.error), self.state)
                          for p in self.raw]
-        if len(self.state["moves"]) != moves:  # the coordinator applied some sent moves
+        if (len(self.state["moves"]), len(self.state["actions"])) != counts:  # applied moves, or cards that are gone
             self.save_state()
         base = board.all_projects(self.projects) if self.tab == 0 else self.projects[self.tab - 1]
         self.view = board.Project(base.slug, base.name, base.path, board.search(base.columns, self.query),
@@ -429,6 +434,18 @@ class Board:
     def pending(self):
         return [m for m in self.state["moves"] if m.get("status", "pending") == "pending"]
 
+    def changes(self):
+        """Everything waiting to be sent, project by project: (project, "action" or "move", entry)."""
+        out = []
+        for pr in self.projects:
+            out += [(pr, "action", a) for a in self.state["actions"] if a["project"] == pr.slug]
+            out += [(pr, "move", m) for m in self.pending() if m["project"] == pr.slug]
+        return out
+
+    def pending_note(self):
+        n = len(self.changes())
+        return f"{n} pending · P to review" if n else "nothing pending"
+
     def follow(self):
         """Keep the selection on whatever is being moved."""
         m, todo_col = self.moving, board.COLUMNS.index("To do")
@@ -461,6 +478,9 @@ class Board:
         else:
             pr = next(p for p in self.projects if p.slug == item.project) if item else None
             why = board.movable(pr.columns["To do"] if pr else [], item)
+            action = board.find_action(self.state, item)
+            if not why and action and action.get("verb"):
+                why = f"Pending: {item.pending}. Backspace cancels it, then the task can move"
             if why:
                 self.say(why)
                 return
@@ -500,8 +520,7 @@ class Board:
         self.save_state()
         self.rowcache = {}
         self.recall(mark)  # folds come back: keep the dropped card (or its heading) selected
-        n = len(self.pending())
-        self.say("Section order saved" if kind == "section" else f"{n} move{'s' if n != 1 else ''} pending · P to review")
+        self.say("Section order saved" if kind == "section" else self.pending_note())
 
     def put_back(self):
         self.state.update(self.moving["undo"])
@@ -509,38 +528,79 @@ class Board:
         self.rebuild()  # rebuild keeps the selection on the card, now back in its place
         self.say("Put back")
 
-    def send_moves(self):
-        """One sentence per project with all its pending moves; sent moves stay shown until TASKS.md has them."""
+    def send_pending(self):
+        """One sentence per project with all its pending changes; sent moves stay shown until TASKS.md has them."""
         self.review = None
         sent, failed = 0, []
         for pr in self.projects:
+            actions = [a for a in self.state["actions"] if a["project"] == pr.slug]
             moves = [m for m in self.pending() if m["project"] == pr.slug]
-            if not moves:
+            if not actions and not moves:
                 continue
             try:
-                board.send(self.cfg, pr.slug, board.move_sentence(moves))
+                board.send(self.cfg, pr.slug, board.batch_sentence(actions, moves))
             except SEND_ERRORS:
                 failed.append(pr.name)
                 continue
+            self.state["actions"] = [a for a in self.state["actions"] if a["project"] != pr.slug]
             for m in moves:
                 m["status"], m["sent_at"] = "sent", time.time()
             sent += 1
         self.save_state()
         self.rebuild()
         if failed:
-            self.say(f"Not sent to {', '.join(failed)}; the moves stay pending")
+            self.say(f"Not sent to {', '.join(failed)}; their changes stay pending")
             return None
         if self.cfg["close_after_send"]:
             return "quit"
         self.say(f"Sent to {sent} coordinator{'s' if sent != 1 else ''}")
         return None
 
-    def discard_moves(self):
+    def discard_pending(self):
         self.state["moves"] = [m for m in self.state["moves"] if m.get("status") == "sent"]
+        self.state["actions"] = []
         self.review = None
         self.save_state()
         self.rebuild()
-        self.say("Pending moves discarded")
+        self.say("Pending changes discarded")
+
+    def open_review(self):
+        if self.changes():
+            self.review, self.review_sel = "open", 0
+        else:
+            self.say("Nothing pending")
+
+    def cancel(self, item):
+        """Backspace on a card: take back its pending action, else its pending move."""
+        action = board.find_action(self.state, item) if item else None
+        if action:
+            self.state["actions"].remove(action)
+            what = board.pending_label(action)
+        elif item and item.moved == "pending":
+            board.cancel_move(self.state, next(p for p in self.raw if p.slug == item.project), item.text)
+            what = "move"
+        else:
+            self.say("Nothing pending on this card")
+            return
+        self.save_state()
+        self.rebuild()
+        self.say(f"Cancelled: {what} · {self.pending_note()}")
+
+    def cancel_selected(self):
+        """Backspace in the review: take back the selected change."""
+        changes = self.changes()
+        pr, kind, entry = changes[min(self.review_sel, len(changes) - 1)]
+        if kind == "action":
+            self.state["actions"].remove(entry)
+        else:
+            board.cancel_move(self.state, next(p for p in self.raw if p.slug == pr.slug), entry["text"])
+        self.save_state()
+        self.rebuild()
+        left = len(self.changes())
+        self.review_sel = min(self.review_sel, max(0, left - 1))
+        if not left:
+            self.review = None
+        self.say(f"Cancelled: {board.pending_line(kind, entry)}")
 
     # actions ---------------------------------------------------------------
     def act(self, kind, value, item=None):
@@ -560,6 +620,8 @@ class Board:
             self.ask_answer(item)
         elif kind == "move":
             self.pick_up()
+        elif kind == "cancel":
+            self.cancel(item)
         else:
             return kind, value
         return None
@@ -569,29 +631,45 @@ class Board:
         if not item or item.kind != "task":
             self.say("Only tasks can be marked done, delegated or dropped")
         elif pr:
-            self.prompt = {"mode": "action", "item": item, "verb": verb, "text": "", "slug": pr.slug,
-                           "title": f"{verb.capitalize()}: send to the {pr.name} coordinator?"}
+            self.prompt = {"mode": "action", "item": item, "verb": verb, "text": self.typed_before(item, verb),
+                           "slug": pr.slug, "title": f"{verb.capitalize()}: send to the {pr.name} coordinator?"}
 
     def ask_answer(self, item):
         pr = self.project_of(item)
         if item and pr:
             title = "Your answer to this decision" if item.kind == "decision" else "Tell the coordinator about this card"
-            self.prompt = {"mode": "answer", "item": item, "text": "", "slug": pr.slug, "title": f"{title} ({pr.name})"}
+            self.prompt = {"mode": "answer", "item": item, "text": self.typed_before(item, ""), "slug": pr.slug,
+                           "title": f"{title} ({pr.name})"}
 
-    def sentence(self):
+    def typed_before(self, item, verb):
+        """What was typed for the card's pending action of this kind, so reopening the box edits it."""
+        action = board.find_action(self.state, item)
+        return action.get("typed", "") if action and action.get("verb", "") == verb else ""
+
+    def prompt_action(self):
         p = self.prompt
-        if p["mode"] == "answer":
-            return board.answer_sentence(p["item"], p["text"])
-        return board.task_sentence(p["verb"], p["item"], p["text"])
+        return {"project": p["slug"], "text": p["item"].text, "kind": p["item"].kind, "thread": p["item"].thread,
+                "verb": p.get("verb", ""), "typed": " ".join(p["text"].split())}
+
+    def add_pending(self):
+        """Tab in the box: keep the action, to send with the project's other pending changes."""
+        board.record_action(self.state, self.prompt_action())
+        self.prompt = None
+        self.save_state()
+        self.rebuild()
+        self.say(f"Added · {self.pending_note()}")
 
     def send(self):
-        sentence, slug = self.sentence(), self.prompt["slug"]
+        action, slug = self.prompt_action(), self.prompt["slug"]
         self.prompt = None
         try:
-            board.send(self.cfg, slug, sentence)
+            board.send(self.cfg, slug, board.action_sentence(action))
         except SEND_ERRORS as e:
             self.say(f"Not sent: {(str(e).splitlines() or [type(e).__name__])[0][:80]}")
             return None
+        board.record_action(self.state, action, queue=False)  # it replaces the card's pending action, if any
+        self.save_state()
+        self.rebuild()
         if self.cfg["close_after_send"]:
             return "quit"
         self.say("Sent: the coordinator will pick it up")
@@ -699,9 +777,9 @@ class Board:
             x += 2
         gear = w - 5
         right = gear - 2
-        pending = len(self.pending())
+        pending = len(self.changes())
         if pending:  # before the time: it must stay visible however many tabs there are
-            note = f"⇅ {pending} move{'s' if pending != 1 else ''} pending · P review"
+            note = f"⇅ {pending} pending · P review"
             right = max(x, right - board.cells(note))
             self.put(0, right, note, t.key | curses.A_BOLD)
             self.hits.append((0, 0, right, right + board.cells(note), "review", None))
@@ -737,7 +815,8 @@ class Board:
 
     def card_label(self, item):
         moved = f"moved · {item.moved}" if item.moved else ""
-        return " · ".join(x for x in (item.label, moved) if x)
+        pending = f"{item.pending} · pending" if item.pending else ""
+        return " · ".join(x for x in (item.label, moved, pending) if x)
 
     def card_lines(self, c, r, width, max_lines):
         key = (c, r, width, max_lines)
@@ -819,7 +898,7 @@ class Board:
                 room = cw - 4 - (len(age) + 1 if age else 0) - (2 if item.link else 0)  # the age and the ↗ sit on this line
                 text = board.fit_label(line, room) if label_line else line
                 attr = (t.muted_sel if chosen else t.muted) if label_line else (t.text_sel if chosen else 0)
-                if label_line and item.moved:
+                if label_line and (item.moved or item.pending):
                     attr = t.key | curses.A_BOLD
                 self.put(y + n, x0 + 2, text, attr | (curses.A_BOLD if chosen and not label_line else 0))
             if carried:
@@ -932,34 +1011,50 @@ class Board:
         self.put(y + hgt - 2, x + 3, hint, t.panel_muted)
 
     def review_panel(self, h, w):
+        """Each project's pending changes, one selectable line each, above the sentence its coordinator gets."""
         t = self.theme
+        changes = self.changes()
+        if not changes:
+            self.review = None
+            return
         wid = min(w - 4, 100)
         inner = wid - 8
         blocks = []
         for pr in self.projects:
-            moves = [m for m in self.pending() if m["project"] == pr.slug]
-            if moves:
-                blocks.append((f"{pr.name} coordinator: {len(moves)} move{'s' if len(moves) != 1 else ''}",
-                               board.wrap(board.move_sentence(moves), inner, 8)))
-        if not blocks:
-            self.review = None
-            return
-        hgt = sum(len(lines) + 2 for _, lines in blocks) + 4
-        y, x, wid = self.box((h - hgt) // 2, (w - wid) // 2, hgt, wid, "Pending moves")
+            mine = [(i, kind, entry) for i, (p, kind, entry) in enumerate(changes) if p is pr]
+            if mine:
+                sentence = board.batch_sentence([e for _, k, e in mine if k == "action"], [e for _, k, e in mine if k == "move"])
+                n = len(mine)
+                blocks.append((f"{pr.name} coordinator: {n} change{'s' if n != 1 else ''}", mine, board.wrap(sentence, inner - 2, 6)))
+        hgt = sum(len(mine) + len(lines) + 3 for _, mine, lines in blocks) + 4
+        # too tall for the screen: the lines alone, without each sentence. shortcut: more changes than the screen
+        # has lines run past the box; give it a scroll position if that is ever seen.
+        brief = hgt > h - 1
+        if brief:
+            hgt = sum(len(mine) + 2 for _, mine, _ in blocks) + 4
+        y, x, wid = self.box((h - hgt) // 2, (w - wid) // 2, hgt, wid, "Pending changes")
         row = y + 2
-        for title, lines in blocks:
+        for title, mine, lines in blocks:
             self.put(row, x + 3, title, t.panel | curses.A_BOLD)
             row += 1
-            for line in lines:
-                self.put(row, x + 5, line, t.panel_muted)
+            for i, kind, entry in mine:
+                chosen = i == self.review_sel
+                self.put(row, x + 3, f"  {board.pending_line(kind, entry)}".ljust(inner + 2)[:inner + 2],
+                         t.panel_sel | curses.A_BOLD if chosen else t.panel)
                 row += 1
+            if not brief:
+                self.put(row, x + 5, "Sent as:", t.panel_muted)
+                row += 1
+                for line in lines:
+                    self.put(row, x + 7, line, t.panel_muted)
+                    row += 1
             row += 1
         if self.review == "discard?":
-            n = len(self.pending())
-            self.put(y + hgt - 2, x + 3, f"Discard all {n} pending move{'s' if n != 1 else ''}? y discards · n keeps them",
+            n = len(changes)
+            self.put(y + hgt - 2, x + 3, f"Discard all {n} pending change{'s' if n != 1 else ''}? y discards · n keeps them",
                      t.panel | curses.A_BOLD)
         else:
-            self.put(y + hgt - 2, x + 3, "Enter send all · Backspace discard all · Esc close", t.panel_muted)
+            self.put(y + hgt - 2, x + 3, "↑↓ choose · ⌫ cancel it · Enter send all · X discard all · Esc close", t.panel_muted)
 
     def help_panel(self, h, w):
         """The keys and what the columns mean, in groups; two columns side by side when one is too tall."""
@@ -1031,12 +1126,12 @@ class Board:
         inner = wid - 6
         if p["mode"] == "answer":
             runs = [(board.answer_sentence(p["item"], ""), "fixed"), (p["text"], "typed")]
-            hint = "type your answer · Enter send · Esc cancel"
+            hint = "type your answer · Enter send · Tab add to pending · Esc cancel"
         else:
             runs = [(board.task_sentence(p["verb"], p["item"]), "fixed")]
             if p["text"]:
                 runs += [("Note:", "fixed"), (p["text"], "typed")]
-            hint = "Enter send · type to add a note · Esc cancel"
+            hint = "Enter send · Tab add to pending · type to add a note · Esc cancel"
         lines = board.wrap_runs(runs, inner - 1)
         about = board.wrap(p["item"].shown(), inner, 2)
         room = max(3, h - 12 - len(about))
@@ -1170,7 +1265,7 @@ class Board:
                 self.open_menu(y, x, None)
         elif b == LEFT:
             if kind == "review":
-                self.review = "open"
+                self.open_review()
             elif kind == "gear":
                 self.settings = 0
             elif kind == "tab":
@@ -1206,10 +1301,14 @@ class Board:
         curses.unget_wch(ch)
 
     def typing(self, ch):
-        """Keys while a search, an answer or a note is being typed. A line break in pasted text is a space."""
+        """Keys while a search, an answer or a note is being typed. A line break or a tab in pasted text is a space."""
         p = self.prompt
-        if ch in ENTER and (self.pasting or self.more_input()):
+        if (ch in ENTER or ch == "\t") and (self.pasting or self.more_input()):
             ch = " "
+        if ch == "\t":
+            if p["mode"] == "action" or p["mode"] == "answer" and p["text"].strip():
+                return self.add_pending()
+            return None
         if ch in ENTER:
             if p["mode"] == "search":
                 self.prompt = None
@@ -1255,13 +1354,19 @@ class Board:
             return False, None
         if self.review == "discard?":
             if ch in ("y", "Y"):
-                self.discard_moves()
+                self.discard_pending()
             elif ch in ("n", "N", "q"):
                 self.review = "open"
             return True, None
         if ch in ENTER:
-            return True, self.send_moves()
-        if ch in BACKSPACE or ch == curses.KEY_DC:
+            return True, self.send_pending()
+        if ch in (curses.KEY_DOWN, "j"):
+            self.review_sel = min(self.review_sel + 1, len(self.changes()) - 1)
+        elif ch in (curses.KEY_UP, "k"):
+            self.review_sel = max(0, self.review_sel - 1)
+        elif ch in BACKSPACE or ch == curses.KEY_DC:
+            self.cancel_selected()
+        elif ch == "X":
             self.review = "discard?"
         elif ch in ("q", "P"):
             self.review = None
@@ -1350,10 +1455,9 @@ class Board:
         elif ch == " ":
             self.pick_up()
         elif ch == "P":
-            if self.pending():
-                self.review = "open"
-            else:
-                self.say("No moves pending")
+            self.open_review()
+        elif ch in BACKSPACE or ch == curses.KEY_DC:
+            self.cancel(item)
         elif ch == "m":
             y, x = self.card_position() if item else (1, 4)
             self.open_menu(y, x, item)

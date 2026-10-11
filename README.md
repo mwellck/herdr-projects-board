@@ -93,14 +93,15 @@ Press `m` or right-click a card: everything you can do with it, grouped, with ea
 
 <img src="docs/images/review.png" alt="The Pending moves box: one sentence for the Mobile app coordinator, with Enter to send all." width="100%">
 
-In herdr-projects, a task's place in TASKS.md is its priority: coordinators work top to bottom. So a moved task shows in its new place, marked *moved · pending*. Move as many as you like, across projects, then press `P`: each project's moves become one sentence to its coordinator, and Enter sends them all.
+In herdr-projects, a task's place in TASKS.md is its priority: coordinators work top to bottom. So a moved task shows in its new place, marked *moved · pending*. Answers and task actions can wait too: press Tab instead of Enter in their box. Gather as many as you like, across projects, then press `P`: each project's changes become one sentence to its coordinator, and Enter sends them all.
 
 <details>
-<summary>Moving tasks and sections in detail</summary>
+<summary>Moving, cancelling and sending in detail</summary>
 
 - **To move something:** press Space on a task or a section heading (or choose Move… from its menu), use ↑/↓ or the scroll wheel, then press Space or click to drop it. Esc puts it back.
 - **Tasks** move within their project. Going past a section's edge takes a task into the next section, which is how a backlog item gets promoted.
-- **Sent moves** stay in place, marked *sent*, until TASKS.md has them (for up to 15 minutes). Pending moves are kept if you close the board.
+- **To cancel something:** press Backspace on its card: its pending action goes first, then its move. In the review (`P`), ↑/↓ picks a change and Backspace cancels it; `X` discards everything pending.
+- **Sent moves** stay in place, marked *sent*, until TASKS.md has them (for up to 15 minutes). Pending changes are kept if you close the board.
 - **Sections** (Stage 1, Backlog…) are the board's own order: a moved section is saved straight away and nothing is sent. Moving Backlog to the top once keeps it there.
 
 </details>
@@ -135,6 +136,8 @@ Changes go to the project's coordinator through `herdr-projects coordinator prom
 
 Mark done, delegate and drop send their sentence as is when you press Enter, or you can type a note first: *… Note: done in PR #12, tested on staging.*
 
+Press Tab instead of Enter to keep it pending and send it later, in one message with the project's other changes (`P`). The card shows what's waiting, such as *done · pending*. Opening the box on it again lets you edit it, and Backspace cancels it. Marking a task done, delegating or dropping it replaces its pending move, which no longer matters.
+
 ## Keys and mouse
 
 `?` shows them all on the board.
@@ -150,10 +153,11 @@ Mark done, delegate and drop send their sentence as is when you press Enter, or 
 | `/` | search every card; Esc clears |
 | Enter | open the card's pull request; on a section heading, fold it; on a folded column, open it; while moving, drop |
 | `g` | go to the card's thread, or to the coordinator |
-| `a`, `x`, `d`, `D` | answer, mark done, delegate, drop |
+| `a`, `x`, `d`, `D` | answer, mark done, delegate, drop; in their box, Enter sends now and Tab adds it to the pending changes |
 | `f`, `F`, `c` | fold the section, every section, the column |
 | Space | pick up a task or a section in To do; ↑/↓ moves it; Space drops it; Esc puts it back |
-| `P` | review the pending task moves and send them |
+| `P` | review the pending changes and send them |
+| Backspace | cancel the card's pending change |
 | `m` | the card's menu |
 | `t` | open the project's TASKS.md in a herdr tab |
 | `s` | settings |
@@ -199,7 +203,7 @@ Settings are saved to `config.toml` in the plugin's config dir (`herdr plugin co
 No. It reads herdr-projects' output and TASKS.md. Every change is a sentence to the coordinator, shown to you first.
 
 **Why does a moved task say *pending*?**
-A task's position is its priority, so a move is a real change for the coordinator. Moves wait until you review them with `P`, so you can batch several, across projects, into one message per project.
+A task's position is its priority, so a move is a real change for the coordinator. Moves, and the answers and actions you add with Tab, wait until you review them with `P`, so you can batch several, across projects, into one message per project.
 
 **Does it work on Windows?**
 No. herdr runs on Windows, but herdr-projects, which the board reads, supports macOS and Linux only. If herdr-projects adds Windows, the board would follow; it would also need a terminal library, since the Windows Python doesn't ship curses.
