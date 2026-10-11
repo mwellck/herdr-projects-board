@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-11)
 
 - **Pending changes:** in the answer, mark done, delegate and drop boxes, Tab keeps the change pending instead of sending it. The card shows it, for example *done · pending*. `P` reviews every pending change, moves included, and sends each coordinator one message.
 - **Cancelling:** Backspace on a card cancels its pending change; in the review, ↑/↓ picks a change and Backspace cancels it. Discard all is now `X`, since Backspace cancels one change.
