@@ -1,0 +1,13 @@
+# The board's settings file: `herdr plugin config-dir herdr-projects-board` prints where it lives.
+# Press s in the board to change the common ones; every key is optional.
+
+# palette = "herdr"            # herdr: follow herdr's theme · soft: the board's own · terminal: the terminal's 16 colours
+# shipped_days = 14            # how far back Shipped looks
+# stale_hours = 24             # a running or reviewed thread untouched this long turns amber
+# refresh_seconds = 5
+# show_review_threads = false  # also show threads without a worktree (reviewers)
+# editor = ""                  # e.g. "nano" or "code"; empty: herdr's $EDITOR (vi when unset)
+# close_after_send = false     # close the board once a message to a coordinator is sent
+# Folds, section order and pending moves are kept in state.json in the plugin's state dir.
+# root = "~/.herdr-projects"   # default: herdr-projects' own order ($HERDR_PROJECTS_ROOT, its config.toml, ~/.herdr-projects)
+# herdr_projects_bin = ""      # default: herdr-projects on PATH, else the herdr-projects plugin's build

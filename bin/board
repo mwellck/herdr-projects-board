@@ -1,0 +1,1478 @@
+#!/usr/bin/env python3
+"""The board popup: every herdr project at a glance, five columns, live, keyboard and mouse.
+
+  board                  draw the board (the plugin's popup pane runs this)
+  board --open           ask herdr to open the popup (the plugin's action runs this)
+  board --once [SLUG]    print the board as plain text and exit (all projects, or one)
+"""
+import curses
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import board  # noqa: E402
+import theme  # noqa: E402
+
+KEYS = [("?", "help"), ("⇥ 1-9", "project"), ("/", "search"), ("⏎", "open"), ("g", "go to"),
+        ("a", "answer"), ("x", "done"), ("␣", "move"), ("f c", "fold"), ("m", "menu"), ("q", "close")]
+HELP = [
+    ("Projects", ""),
+    ("Tab, Shift-Tab", "next, previous project"),
+    ("1-9", "All projects, then each project"),
+    ("/", "search the cards; Esc clears"),
+    ("Cards", ""),
+    ("arrows, h j k l", "move between columns, sections and cards"),
+    ("Enter", "open the card's pull request; on a heading, fold it; on a folded column, open it"),
+    ("g", "go to the card's thread, or the coordinator"),
+    ("m, right-click", "everything you can do with the card"),
+    ("Folding (kept between runs)", ""),
+    ("f", "fold or unfold the selected card's section"),
+    ("F", "fold or unfold every section in the column"),
+    ("c", "fold or unfold the column"),
+    ("click", "a section's or a column's heading folds it"),
+    ("Arrange To do", ""),
+    ("Space", "pick up a task or a section; arrows move it; Space drops it"),
+    ("Esc", "while moving: put it back"),
+    ("P", "review the moved tasks, then send them to each coordinator"),
+    ("", "sections are the board's own order; task moves change TASKS.md"),
+    ("Talk to the coordinator (asks before sending)", ""),
+    ("a", "answer a decision, or tell it something about the card"),
+    ("x", "mark a task done (type to add a note)"),
+    ("d", "delegate a task (type to add a note)"),
+    ("D", "drop a task (type to add a note)"),
+    ("Board", ""),
+    ("t", "open the project's TASKS.md"),
+    ("s, ⚙", "settings"),
+    ("r", "refresh now"),
+    ("q, Esc", "close"),
+    ("Columns", ""),
+    ("Needs you", "decisions to answer, tasks assigned to you, threads waiting on you"),
+    ("To do", "open tasks in TASKS.md that no thread runs yet"),
+    ("In progress", "threads at work; amber age = untouched for a while"),
+    ("In review", "threads with an open pull request or a report to review"),
+    ("Shipped", "pull requests merged recently"),
+]
+NARROW = 100       # below this width, one column at a time
+FOLDED_W = 16      # a folded column's width
+TOP = 2           # column headings start here, under the tabs (row 0) and the status line (row 1)
+# The mouse is read as raw SGR reports (ESC [ < button ; x ; y M), not through curses' getmouse:
+# macOS ships an ncurses whose mouse API cannot report the wheel scrolling down.
+MOUSE_ON, MOUSE_OFF = "\033[?1000h\033[?1006h", "\033[?1000l\033[?1006l"
+# Bracketed paste: pasted text arrives between ESC[200~ and ESC[201~, so a line break in it is not Enter.
+PASTE_ON, PASTE_OFF, PASTE_START, PASTE_END = "\033[?2004h", "\033[?2004l", "[200~", "[201~"
+LEFT, RIGHT, WHEEL_UP, WHEEL_DOWN = 0, 2, 64, 65
+FLASH_SECONDS = 4
+TICK_MS = 200      # how often the loop wakes without a key: to take in a finished refresh, or start the next
+EXACT_SLOTS = 200  # first of the colour slots redefined to herdr's exact theme colours (restored on exit)
+ENTER, BACKSPACE = ("\n", "\r", curses.KEY_ENTER), ("\x7f", "\b", curses.KEY_BACKSPACE)
+TASK_VERBS = {"x": "mark as done", "d": "delegate", "D": "drop"}
+SEND_ERRORS = (FileNotFoundError, RuntimeError, OSError, subprocess.TimeoutExpired)
+
+
+def parse_sgr(seq):
+    """'[<0;12;3M' -> (button, x, y) with 0-based x, y for a press; None for releases and anything else."""
+    if not (seq.startswith("[<") and seq.endswith("M")):
+        return None
+    try:
+        b, x, y = (int(v) for v in seq[2:-1].split(";"))
+    except ValueError:
+        return None
+    return b, x - 1, y - 1
+
+
+def open_popup():
+    herdr = os.environ.get("HERDR_BIN_PATH", "herdr")
+    plugin = os.environ.get("HERDR_PLUGIN_ID", "herdr-projects-board")
+    subprocess.run([herdr, "plugin", "pane", "open", "--plugin", plugin, "--entrypoint", "board"], check=False)
+
+
+def open_link(url):
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    subprocess.run([opener, url], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def copy(text):
+    for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(tool[0]):
+            subprocess.run(tool, input=text, text=True, check=False)
+            return True
+    return False
+
+
+class Theme:
+    """Colour pairs by role, from herdr's theme, the board's soft palette, or the terminal's 16 colours.
+    Terminals without colour get bold, dim and reverse instead."""
+
+    SOFT = dict(red=203, todo=146, blue=75, yellow=179, green=114, muted=245, faint=239, sel=237, panel=235,
+                on_accent=234, accent=75, stale=215)
+
+    def __init__(self, mode):
+        self.name, self.slots = "terminal", []  # slots: colours redefined for herdr's exact theme, reset on exit
+        if not curses.has_colors():
+            self.plain()
+            return
+        try:
+            curses.use_default_colors()
+            default_fg = default_bg = -1
+        except curses.error:
+            default_fg, default_bg = curses.COLOR_WHITE, curses.COLOR_BLACK
+        rich = curses.COLORS >= 256
+        c = None
+        if rich and mode == "herdr":
+            try:
+                pal = theme.herdr_palette()
+            except Exception:  # an unreadable herdr config: fall back to the board's own palette
+                pal = None
+            if pal and curses.can_change_color():
+                slots = {}
+                for i, (k, colour) in enumerate(pal.items()):
+                    slot = EXACT_SLOTS + i
+                    curses.init_color(slot, *(round(v * 1000 / 255) for v in colour))
+                    self.slots.append(slot)
+                    slots[k] = slot
+            elif pal:
+                slots = {k: theme.nearest_256(v) for k, v in pal.items()}
+            if pal:
+                s = slots
+                c = dict(red=s["red"], todo=s["subtext0"], blue=s["blue"], yellow=s["yellow"], green=s["green"],
+                         muted=s["subtext0"], faint=s["overlay0"], sel=s["surface0"], panel=s["surface0"],
+                         on_accent=s["base"], accent=s["accent"], stale=s["peach"])
+                self.name = "herdr"
+        if rich and c is None and mode != "terminal":
+            c, self.name = dict(self.SOFT), "soft"
+        n = 0
+
+        def pair(fg, bg=-1):
+            nonlocal n
+            n += 1
+            curses.init_pair(n, default_fg if fg == -1 else fg, default_bg if bg == -1 else bg)
+            return curses.color_pair(n)
+
+        if c:
+            accents = dict(zip(board.COLUMNS, (c["red"], c["todo"], c["blue"], c["yellow"], c["green"])))
+            self.accent = {k: pair(v) for k, v in accents.items()}
+            self.accent_sel = {k: pair(v, c["sel"]) for k, v in accents.items()}
+            self.muted, self.faint = pair(c["muted"]), pair(c["faint"])
+            self.text_sel, self.muted_sel = pair(-1, c["sel"]), pair(c["muted"], c["sel"])
+            self.tab, self.badge = pair(c["on_accent"], c["accent"]), pair(c["on_accent"], c["red"])
+            self.key, self.done, self.stale = pair(c["accent"]), pair(c["green"]), pair(c["stale"])
+            self.stale_sel = pair(c["stale"], c["sel"])
+            self.panel, self.panel_muted = pair(-1, c["panel"]), pair(c["muted"], c["panel"])
+            self.panel_sel = pair(c["on_accent"], c["accent"])
+        else:  # the terminal's own colours: selections reversed, panels plain
+            ansi = (curses.COLOR_RED, -1, curses.COLOR_BLUE, curses.COLOR_YELLOW, curses.COLOR_GREEN)
+            self.accent = {k: pair(v) for k, v in zip(board.COLUMNS, ansi)}
+            self.accent_sel = {k: v | curses.A_REVERSE for k, v in self.accent.items()}
+            self.muted = self.faint = curses.A_DIM
+            self.text_sel = self.muted_sel = curses.A_REVERSE
+            self.tab, self.badge = curses.A_REVERSE, pair(curses.COLOR_RED) | curses.A_REVERSE
+            self.key, self.done = pair(curses.COLOR_BLUE), pair(curses.COLOR_GREEN)
+            self.stale = pair(curses.COLOR_YELLOW)
+            self.stale_sel = self.stale | curses.A_REVERSE
+            self.panel, self.panel_muted, self.panel_sel = 0, curses.A_DIM, curses.A_REVERSE
+
+    def plain(self):
+        self.accent = {k: curses.A_BOLD for k in board.COLUMNS}
+        self.accent_sel = {k: curses.A_BOLD | curses.A_REVERSE for k in board.COLUMNS}
+        self.muted = self.faint = curses.A_DIM
+        self.text_sel = self.muted_sel = self.tab = self.badge = curses.A_REVERSE
+        self.key, self.done = curses.A_BOLD, curses.A_BOLD
+        self.stale, self.stale_sel = curses.A_BOLD, curses.A_BOLD | curses.A_REVERSE
+        self.panel, self.panel_muted, self.panel_sel = 0, curses.A_DIM, curses.A_REVERSE
+
+    def restore(self):
+        """Give the terminal back its own colours for the slots redefined (OSC 104 resets them)."""
+        if self.slots:
+            sys.stdout.write("\033]104;" + ";".join(map(str, self.slots)) + "\a")
+            sys.stdout.flush()
+            self.slots = []
+
+
+class Board:
+    def __init__(self, screen, cfg, config_dir, state_dir):
+        self.s, self.cfg, self.config_dir, self.state_dir = screen, cfg, config_dir, state_dir
+        self.state = board.load_state(state_dir) if state_dir else json.loads(json.dumps(board.EMPTY_STATE))
+        self.raw, self.projects, self.loaded, self.error = [], [], 0, ""  # raw: as loaded; projects: arranged
+        self.tab = 0          # 0: All projects, then each project
+        self.col = self.row = 0   # row: index into the column's rows (section headings and cards)
+        self.offset = {}      # (tab, column) -> first row shown
+        self.hits = []        # (y0, y1, x0, x1, kind, value) from the last draw, for the mouse
+        self.menu = None      # {"y", "x", "entries", "sel", "item"} while a menu is open
+        self.settings = None  # selected setting while the settings panel is open
+        self.help = None      # the help's scroll position while it is open
+        self.query = ""       # the search filter
+        self.prompt = None    # {"mode": search|answer|action, "item", "text", "slug", "title", "verb"}
+        self.flash, self.flash_at = "", 0
+        self.view, self.layout, self.rowcache = None, {}, {}
+        self.theme = None
+        self.moving = None    # the task or section picked up, with the state to restore on Esc
+        self.review = None    # the pending-moves review panel: "open", or "discard?" while asking to discard
+        self.pasting = False  # inside a bracketed paste
+        self.results = queue.Queue()  # finished background refreshes, applied by the main loop
+        self.loading, self.next_refresh, self.announce = False, 0.0, False
+        self.menu_project = None  # the project a menu was opened for
+        self.narrow = False   # one column at a time: column folds do not apply
+
+    # data and selection -------------------------------------------------
+    def fetch(self, cfg):
+        """Load every project; any failure comes back as an error message instead of raising."""
+        try:
+            raw, _, loaded = board.load_all(cfg)
+            return raw, loaded, ""
+        except Exception as e:  # herdr-projects missing, hanging or broken: say so instead of crashing
+            return None, None, str(e) if isinstance(e, (FileNotFoundError, RuntimeError)) else f"{type(e).__name__}: {e}"
+
+    def refresh_data(self):
+        """Load now and apply it (the first load, and tests)."""
+        self.apply(self.fetch(self.cfg))
+
+    def start_refresh(self, announce=False):
+        """Load in the background, so keys never wait for herdr-projects; the loop applies the result."""
+        if self.loading:
+            return
+        self.loading, self.announce = True, self.announce or announce
+        cfg = dict(self.cfg)
+
+        def work():
+            self.results.put(self.fetch(cfg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def busy(self):
+        """Something is open; new data waits so nothing moves under a menu, a move or a box."""
+        return bool(self.menu or self.settings is not None or self.prompt or self.help is not None
+                    or self.moving or self.review)
+
+    def take_results(self):
+        if self.busy():
+            return
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            return
+        self.loading = False
+        self.apply(result)
+        if self.announce:
+            self.announce = False
+            self.say("Refreshed")
+
+    def apply(self, result):
+        raw, loaded, error = result
+        tab_slug = self.projects[self.tab - 1].slug if self.tab and self.tab <= len(self.projects) else ""
+        self.error = error
+        if not error:
+            self.raw, self.loaded = raw, loaded
+            listed = {p.slug for p in self.raw}
+            kept = [m for m in self.state["moves"] if m["project"] in listed]
+            if len(kept) != len(self.state["moves"]):  # their project was archived or renamed
+                self.state["moves"] = kept
+                self.save_state()
+        slugs = [p.slug for p in self.raw]
+        self.tab = slugs.index(tab_slug) + 1 if tab_slug in slugs else min(self.tab, len(self.raw))
+        self.rebuild()
+
+    def rebuild(self):
+        mark = self.remember()
+        moves = len(self.state["moves"])
+        self.projects = [board.arrange(board.Project(p.slug, p.name, p.path, dict(p.columns), p.error), self.state)
+                         for p in self.raw]
+        if len(self.state["moves"]) != moves:  # the coordinator applied some sent moves
+            self.save_state()
+        base = board.all_projects(self.projects) if self.tab == 0 else self.projects[self.tab - 1]
+        self.view = board.Project(base.slug, base.name, base.path, board.search(base.columns, self.query),
+                                  base.error)
+        self.layout, self.rowcache = {}, {}  # wrapped cards and rows; laying out is the slow part of a redraw
+        self.recall(mark)
+
+    def remember(self):
+        """What is selected, by identity rather than position, so a refresh or a fold keeps it."""
+        if not self.view:
+            return None
+        r = self.current_row()
+        if r and r[0] == "card":
+            item = self.items()[r[1]]
+            return ("card", self.col, item.project, item.text)
+        if r and r[0] == "section":
+            return ("section", self.col, r[1])
+        return ("column", self.col)
+
+    def recall(self, mark):
+        """Select what remember() saw; a card now hidden in a folded section selects that section's heading."""
+        rows = self.rows()
+        if mark:
+            self.col = mark[1]
+            rows = self.rows()
+            for i, r in enumerate(rows):
+                if mark[0] == "card" and r[0] == "card" and (self.items()[r[1]].project, self.items()[r[1]].text) == mark[2:]:
+                    self.row = i
+                    return
+                if mark[0] == "section" and r[0] == "section" and r[1] == mark[2]:
+                    self.row = i
+                    return
+            if mark[0] == "card":
+                hidden = next((it for it in self.items() if (it.project, it.text) == mark[2:]), None)
+                key = hidden and hidden.section and board.fold_key(board.COLUMNS[self.col], hidden)
+                for i, r in enumerate(rows):
+                    if r[0] == "section" and r[1] == key:
+                        self.row = i
+                        return
+        self.row = min(self.row, max(0, len(rows) - 1))
+
+    def project_of(self, item=None):
+        """The real project behind a card (on All projects, the card's own)."""
+        if self.tab:
+            return self.projects[self.tab - 1]
+        slug = item.project if item else ""
+        return next((p for p in self.projects if p.slug == slug), None)
+
+    def items(self, col=None):
+        return self.view.columns[board.COLUMNS[self.col if col is None else col]] if self.view else []
+
+    def rows(self, col=None):
+        col = self.col if col is None else col
+        if col not in self.rowcache:
+            folds = {} if self.query or self.moving else self.state["sections"]  # searching and moving open every section
+            self.rowcache[col] = board.rows(self.items(col), board.COLUMNS[col], folds)
+        return self.rowcache[col]
+
+    def current_row(self):
+        rows = self.rows()
+        return rows[self.row] if self.row < len(rows) else None
+
+    def selected(self):
+        """The selected card; none in a folded column, whose cards are not shown."""
+        r = self.current_row()
+        return self.items()[r[1]] if r and r[0] == "card" and not self.column_folded(self.col) else None
+
+    def column_folded(self, col):
+        return not self.narrow and board.COLUMNS[col] in self.state["columns"]
+
+    def first_item(self):
+        self.col = next((c for c in range(len(board.COLUMNS)) if self.rows(c) and not self.column_folded(c)), 0)
+        rows = self.rows()
+        self.row = next((i for i, r in enumerate(rows) if r[0] == "card"), 0)
+
+    def switch(self, step=None, to=None):
+        count = len(self.projects) + 1
+        self.tab = to if to is not None else (self.tab + step) % count
+        self.tab = max(0, min(self.tab, count - 1))
+        self.rebuild()
+        self.first_item()
+
+    def move(self, dcol=0, drow=0):
+        if dcol:  # folded columns are passed over
+            for _ in board.COLUMNS:
+                self.col = (self.col + dcol) % len(board.COLUMNS)
+                if not self.column_folded(self.col):
+                    break
+            self.row = min(self.row, max(0, len(self.rows()) - 1))
+        if drow:
+            self.row = max(0, min(len(self.rows()) - 1, self.row + drow))
+
+    def say(self, text):
+        self.flash, self.flash_at = text, time.time()
+
+    # folding -----------------------------------------------------------------
+    def save_state(self):
+        if self.state_dir:
+            board.save_state(self.state_dir, self.state)
+
+    def fold_section(self, key, folded=None):
+        sections = self.state["sections"]
+        sections[key] = (not board.is_folded(sections, key)) if folded is None else folded
+        self.save_state()
+        self.rowcache = {}
+        rows = self.rows()  # keep the selection on that section's heading
+        self.row = next((i for i, r in enumerate(rows) if r[0] == "section" and r[1] == key), min(self.row, len(rows) - 1))
+
+    def fold_current(self):
+        """f: the selected heading, or the section of the selected card."""
+        r = self.current_row()
+        if r and r[0] == "section":
+            self.fold_section(r[1])
+            return
+        item = self.selected()
+        if item and item.section:
+            self.fold_section(board.fold_key(board.COLUMNS[self.col], item), True)
+        else:
+            self.say("This card is not in a section")
+
+    def fold_all(self):
+        """F: fold every section in the column, or open them all when they already are."""
+        headings = [r for r in board.rows(self.items(), board.COLUMNS[self.col], {}) if r[0] == "section"]
+        if not headings:
+            self.say("No sections in this column")
+            return
+        fold = not all(board.is_folded(self.state["sections"], r[1]) for r in headings)
+        for r in headings:
+            self.state["sections"][r[1]] = fold
+        self.save_state()
+        self.rowcache = {}
+        self.row = 0
+
+    def fold_column(self, col=None):
+        if self.narrow:
+            self.say("Columns fold in a wider window")
+            return
+        name = board.COLUMNS[self.col if col is None else col]
+        cols = self.state["columns"]
+        cols.remove(name) if name in cols else cols.append(name)
+        self.save_state()
+
+    # arranging -------------------------------------------------------------
+    def pending(self):
+        return [m for m in self.state["moves"] if m.get("status", "pending") == "pending"]
+
+    def follow(self):
+        """Keep the selection on whatever is being moved."""
+        m, todo_col = self.moving, board.COLUMNS.index("To do")
+        self.col = todo_col
+        for i, r in enumerate(self.rows()):
+            if m["kind"] == "task" and r[0] == "card":
+                it = self.items()[r[1]]
+                if it.project == m["project"] and it.text == m["text"]:
+                    self.row = i
+                    return
+            if m["kind"] == "section" and r[0] == "section" and r[1] == f"To do|{m['project']}|{m['group']}":
+                self.row = i
+                return
+
+    def pick_up(self):
+        row, item = self.current_row(), self.selected()
+        if board.COLUMNS[self.col] != "To do" or not row or self.column_folded(self.col):
+            self.say("Only tasks and sections in To do can be moved")
+            return
+        if self.query:
+            self.say("Clear the search (Esc) to move things: it hides tasks you would move past")
+            return
+        undo = board.copy_state({"moves": self.state["moves"], "order": self.state["order"]})
+        if row[0] == "section":
+            first = next(it for it in self.items() if board.fold_key("To do", it) == row[1])
+            if not first.group:
+                self.say("Tasks outside a section stay where TASKS.md has them")
+                return
+            self.moving = {"kind": "section", "project": first.project, "group": first.group, "undo": undo}
+        else:
+            pr = next(p for p in self.projects if p.slug == item.project) if item else None
+            why = board.movable(pr.columns["To do"] if pr else [], item)
+            if why:
+                self.say(why)
+                return
+            self.moving = {"kind": "task", "project": item.project, "text": item.text, "undo": undo}
+        self.rowcache = {}
+        self.follow()
+        self.say("Moving: arrows move it · Space drops it · Esc puts it back")
+
+    def step(self, direction):
+        m = self.moving
+        pr = next(p for p in self.projects if p.slug == m["project"])
+        raw = next(p for p in self.raw if p.slug == m["project"])
+        todo = pr.columns["To do"]
+        if m["kind"] == "section":
+            order = board.sections_of(todo)
+            i = order.index(m["group"])
+            j = i + direction
+            if not 0 <= j < len(order):
+                return
+            order[i], order[j] = order[j], order[i]
+            self.state["order"][m["project"]] = order
+        else:
+            item = next(it for it in todo if it.text == m["text"])
+            target = board.move_for(todo, item, direction)
+            if target is None:
+                self.say("Already at the " + ("top" if direction < 0 else "bottom"))
+                return
+            move = {"project": m["project"], "text": m["text"], "section": target[0], "before": target[1], "status": "pending"}
+            board.record_move(self.state, raw, move)
+        self.rebuild()
+        self.follow()
+
+    def drop(self):
+        kind = self.moving["kind"]
+        mark = self.remember()
+        self.moving = None
+        self.save_state()
+        self.rowcache = {}
+        self.recall(mark)  # folds come back: keep the dropped card (or its heading) selected
+        n = len(self.pending())
+        self.say("Section order saved" if kind == "section" else f"{n} move{'s' if n != 1 else ''} pending · P to review")
+
+    def put_back(self):
+        self.state.update(self.moving["undo"])
+        self.moving = None
+        self.rebuild()  # rebuild keeps the selection on the card, now back in its place
+        self.say("Put back")
+
+    def send_moves(self):
+        """One sentence per project with all its pending moves; sent moves stay shown until TASKS.md has them."""
+        self.review = None
+        sent, failed = 0, []
+        for pr in self.projects:
+            moves = [m for m in self.pending() if m["project"] == pr.slug]
+            if not moves:
+                continue
+            try:
+                board.send(self.cfg, pr.slug, board.move_sentence(moves))
+            except SEND_ERRORS:
+                failed.append(pr.name)
+                continue
+            for m in moves:
+                m["status"], m["sent_at"] = "sent", time.time()
+            sent += 1
+        self.save_state()
+        self.rebuild()
+        if failed:
+            self.say(f"Not sent to {', '.join(failed)}; the moves stay pending")
+            return None
+        if self.cfg["close_after_send"]:
+            return "quit"
+        self.say(f"Sent to {sent} coordinator{'s' if sent != 1 else ''}")
+        return None
+
+    def discard_moves(self):
+        self.state["moves"] = [m for m in self.state["moves"] if m.get("status") == "sent"]
+        self.review = None
+        self.save_state()
+        self.rebuild()
+        self.say("Pending moves discarded")
+
+    # actions ---------------------------------------------------------------
+    def act(self, kind, value, item=None):
+        """Run an action. herdr and herdr-projects commands close the board first (returned to main)."""
+        item = item or self.selected()
+        if kind == "link":
+            if board.web_link(value):
+                open_link(value)
+                self.say("Opened in the browser")
+            else:
+                self.say("Not a web link, so not opened")
+        elif kind == "copy":
+            self.say("Copied" if copy(value) else "No clipboard tool found")
+        elif kind == "task":
+            self.ask_action(item, value)
+        elif kind == "answer":
+            self.ask_answer(item)
+        elif kind == "move":
+            self.pick_up()
+        else:
+            return kind, value
+        return None
+
+    def ask_action(self, item, verb):
+        pr = self.project_of(item)
+        if not item or item.kind != "task":
+            self.say("Only tasks can be marked done, delegated or dropped")
+        elif pr:
+            self.prompt = {"mode": "action", "item": item, "verb": verb, "text": "", "slug": pr.slug,
+                           "title": f"{verb.capitalize()}: send to the {pr.name} coordinator?"}
+
+    def ask_answer(self, item):
+        pr = self.project_of(item)
+        if item and pr:
+            title = "Your answer to this decision" if item.kind == "decision" else "Tell the coordinator about this card"
+            self.prompt = {"mode": "answer", "item": item, "text": "", "slug": pr.slug, "title": f"{title} ({pr.name})"}
+
+    def sentence(self):
+        p = self.prompt
+        if p["mode"] == "answer":
+            return board.answer_sentence(p["item"], p["text"])
+        return board.task_sentence(p["verb"], p["item"], p["text"])
+
+    def send(self):
+        sentence, slug = self.sentence(), self.prompt["slug"]
+        self.prompt = None
+        try:
+            board.send(self.cfg, slug, sentence)
+        except SEND_ERRORS as e:
+            self.say(f"Not sent: {(str(e).splitlines() or [type(e).__name__])[0][:80]}")
+            return None
+        if self.cfg["close_after_send"]:
+            return "quit"
+        self.say("Sent: the coordinator will pick it up")
+        return None
+
+    def open_menu(self, y, x, item):
+        pr = self.project_of(item) if item else (self.projects[self.tab - 1] if self.tab else None)
+        if not pr:
+            self.say("Select a card, or right-click a project's tab")
+            return
+        title = (f"{item.label} · {item.text}" if item.label else item.text) if item else pr.name
+        self.menu_project = pr.slug
+        self.menu = {"y": y, "x": x, "entries": board.actions_for(pr, item), "sel": 0, "item": item, "title": title}
+
+    def card_position(self):
+        for y0, _, x0, _, kind, value in self.hits:
+            if kind == "row" and value == (self.col, self.row):
+                return y0, x0 + 2
+        return 6, 4
+
+    def change_setting(self, row, step):
+        _, key, _, choices, _ = board.EDITABLE[row]
+        if choices is None:  # an action
+            if key == "reset_layout":
+                self.state.update(sections={}, columns=[], order={})
+                self.save_state()
+                self.rebuild()
+                self.say("Folds and section order reset")
+            return
+        choices = choices() if callable(choices) else choices
+        current = self.cfg[key]
+        i = choices.index(current) if current in choices else 0
+        self.cfg[key] = choices[(i + step) % len(choices)]
+        if key == "palette":
+            self.theme.restore()
+            self.theme = Theme(self.cfg["palette"])
+        if self.config_dir:
+            board.save_config(self.config_dir, self.cfg)
+            self.say("Saved")
+        else:
+            self.say("Changed for now: run inside herdr to save settings")
+        self.refresh_data()  # now, not in the background: new data waits while the panel is open
+
+    # drawing ---------------------------------------------------------------
+    def put(self, y, x, text, attr=0):
+        h, w = self.s.getmaxyx()
+        if 0 <= y < h and 0 <= x < w - 1:
+            try:
+                self.s.addstr(y, x, board.clip(text, w - x - 1), attr)
+            except curses.error:  # writing into the bottom-right cell raises after it draws
+                pass
+
+    def draw(self):
+        s, t = self.s, self.theme
+        s.erase()
+        self.hits = []
+        h, w = s.getmaxyx()
+        if self.error:
+            self.put(1, 2, self.error, t.accent["Needs you"])
+        elif not self.projects:
+            self.put(1, 2, "No active herdr projects.", t.faint)
+        else:
+            self.narrow = w < NARROW
+            self.tabs(w)
+            self.subtitle(w)
+            if self.narrow:
+                self.column(self.col, 2, w - 6, TOP, h - 2, narrow=True)
+            else:
+                folded = [c for c in range(len(board.COLUMNS)) if self.column_folded(c)]
+                open_w = (w - 4 - len(folded) * (FOLDED_W + 2)) // max(1, len(board.COLUMNS) - len(folded))
+                x = 2
+                for c in range(len(board.COLUMNS)):
+                    width = FOLDED_W if c in folded else open_w - 2
+                    if c in folded:
+                        self.folded_column(c, x, width, TOP)
+                    else:
+                        self.column(c, x, width, TOP, h - 2, narrow=False)
+                    x += width + 2
+        self.footer(h, w)
+        if self.settings is not None:
+            self.settings_panel(h, w)
+        if self.help is not None:
+            self.help_panel(h, w)
+        if self.review:
+            self.review_panel(h, w)
+        if self.prompt:
+            self.prompt_panel(h, w)
+        if self.menu:
+            self.draw_menu()
+        s.refresh()
+
+    def tabs(self, w):
+        t, x = self.theme, 2
+        needs = sum(len(p.columns["Needs you"]) for p in self.projects)
+        for i, (name, need) in enumerate([("All projects", needs)] + [(p.name, len(p.columns["Needs you"])) for p in self.projects]):
+            label = f" {name} "
+            self.put(0, x, label, t.tab | curses.A_BOLD if i == self.tab else t.muted)
+            self.hits.append((0, 0, x, x + board.cells(label), "tab", i))
+            x += board.cells(label)
+            if need:
+                badge = f" {need} "
+                self.put(0, x, badge, t.badge | curses.A_BOLD)
+                self.hits.append((0, 0, x, x + len(badge), "tab", i))
+                x += len(badge)
+            x += 2
+        gear = w - 5
+        right = gear - 2
+        pending = len(self.pending())
+        if pending:  # before the time: it must stay visible however many tabs there are
+            note = f"⇅ {pending} move{'s' if pending != 1 else ''} pending · P review"
+            right = max(x, right - board.cells(note))
+            self.put(0, right, note, t.key | curses.A_BOLD)
+            self.hits.append((0, 0, right, right + board.cells(note), "review", None))
+            right -= 3
+        stamp = "updating…" if self.loading else time.strftime("updated %H:%M:%S", time.localtime(self.loaded))
+        if right - len(stamp) >= x:
+            self.put(0, right - len(stamp), stamp, t.faint)
+        self.put(0, gear, "⚙", t.muted | curses.A_BOLD)
+        self.hits.append((0, 0, gear - 1, gear + 2, "gear", None))
+
+    def subtitle(self, w):
+        """The line under the tabs: the search, or an error."""
+        t, pr, row, x = self.theme, self.view, 1, 2
+        if self.query or (self.prompt and self.prompt["mode"] == "search"):
+            text = f"search: {self.query}"
+            self.put(row, x, text, t.key | curses.A_BOLD)
+            x += board.cells(text) + 2
+            self.put(row, x, "Esc clears", t.faint)
+            x += 14
+        if pr.error:
+            self.put(row, x, board.clip(pr.error, max(0, w - x - 4)), t.accent["Needs you"])
+
+    def folded_column(self, c, x0, cw, top):
+        t, name = self.theme, board.COLUMNS[c]
+        active = c == self.col
+        label = f"▸ {name.upper()}"
+        self.put(top, x0, board.clip(label, cw - 3), t.accent[name] | curses.A_BOLD | (curses.A_REVERSE if active else 0))
+        count = str(len(self.items(c)))
+        self.put(top, x0 + cw - len(count), count, t.muted)
+        self.put(top + 1, x0, "─" * cw, t.accent[name] if active else t.faint)
+        self.put(top + 3, x0, "folded · c opens" if active else "folded", t.faint)
+        self.hits.append((top, top + 3, x0, x0 + cw, "colhead", c))
+
+    def card_label(self, item):
+        moved = f"moved · {item.moved}" if item.moved else ""
+        return " · ".join(x for x in (item.label, moved) if x)
+
+    def card_lines(self, c, r, width, max_lines):
+        key = (c, r, width, max_lines)
+        if key not in self.layout:
+            item = self.items(c)[r]
+            label = self.card_label(item)
+            self.layout[key] = ([label] if label else []) + board.wrap(item.shown(), width, max_lines)
+        return self.layout[key]
+
+    def column(self, c, x0, cw, top, bottom, narrow):
+        t, name = self.theme, board.COLUMNS[c]
+        items = self.items(c)
+        active = c == self.col
+        if narrow:  # column pills instead of a header
+            x = x0
+            for i, other in enumerate(board.COLUMNS):
+                label = f" {other} {len(self.items(i))} "
+                self.put(top, x, label, (t.accent[other] | curses.A_REVERSE | curses.A_BOLD) if i == c else t.muted)
+                self.hits.append((top, top, x, x + len(label), "col", i))
+                x += len(label) + 1
+        else:
+            self.put(top, x0, "▾ ", t.faint)
+            self.put(top + 0, x0 + 2, "● ", t.accent[name])
+            self.put(top, x0 + 4, name.upper(), t.accent[name] | curses.A_BOLD)
+            count = str(len(items))
+            self.put(top, x0 + cw - len(count), count, t.muted)
+            self.put(top + 1, x0, ("━" if active else "─") * cw, t.accent[name] if active else t.faint)
+            self.hits.append((top, top + 1, x0, x0 + cw, "colhead", c))
+        y0 = top + 3 if not narrow else top + 2
+        rows = self.rows(c)
+        if not rows:
+            self.put(y0, x0, "No matches" if self.query else "Nothing here", t.faint)
+            return
+        max_lines = 1 if narrow else 3
+
+        def height(r):
+            return 1 if r[0] == "section" else len(self.card_lines(c, r[1], cw - 4, max_lines)) + 1
+
+        room = bottom - y0
+        key = (self.tab, c)
+        off = min(self.offset.get(key, 0), len(rows) - 1)
+        if active:  # keep the selected row in view
+            sel = min(self.row, len(rows) - 1)
+            off = min(off, sel)
+            while sum(height(r) for r in rows[off:sel + 1]) > room and off < sel:
+                off += 1
+            self.offset[key] = off
+        if off:
+            self.put(y0 - 1, x0 + cw - 2, "↑", t.faint)
+        y = y0
+        for i, r in enumerate(rows[off:], off):
+            if y + height(r) - 1 > bottom:
+                self.put(bottom, x0 + cw - 2, "↓", t.faint)
+                break
+            chosen = active and i == self.row
+            if r[0] == "section":
+                _, fkey, heading, count, folded = r
+                text = f"{'▸' if folded else '▾'} {heading.upper()}"
+                if self.moving and self.moving["kind"] == "section" and fkey == f"To do|{self.moving['project']}|{self.moving['group']}":
+                    text = f"⇅ {heading.upper()}"
+                attr = (t.muted_sel if chosen else t.muted) | curses.A_BOLD
+                if chosen:
+                    self.put(y, x0, " " * cw, t.text_sel)
+                self.put(y, x0, board.clip(text, cw - len(str(count)) - 2), attr)
+                self.put(y, x0 + cw - len(str(count)), str(count), t.muted_sel if chosen else t.faint)
+                self.hits.append((y, y, x0, x0 + cw, "section", (c, i)))
+                y += 1 if not folded else 2
+                continue
+            item = items[r[1]]
+            lines = self.card_lines(c, r[1], cw - 4, max_lines)
+            has_label = bool(self.card_label(item))
+            carried = self.moving and self.moving["kind"] == "task" and item.project == self.moving["project"] \
+                and item.text == self.moving["text"]
+            age = board.age_text(item.age) if item.kind == "thread" else ""
+            for n, line in enumerate(lines):
+                self.put(y + n, x0, " " * cw, t.text_sel if chosen else 0)
+                self.put(y + n, x0, "▌", (t.accent_sel[name] if chosen else t.accent[name]) | curses.A_BOLD)
+                label_line = has_label and n == 0
+                room = cw - 4 - (len(age) + 1 if age else 0) - (2 if item.link else 0)  # the age and the ↗ sit on this line
+                text = board.fit_label(line, room) if label_line else line
+                attr = (t.muted_sel if chosen else t.muted) if label_line else (t.text_sel if chosen else 0)
+                if label_line and item.moved:
+                    attr = t.key | curses.A_BOLD
+                self.put(y + n, x0 + 2, text, attr | (curses.A_BOLD if chosen and not label_line else 0))
+            if carried:
+                self.put(y, x0 + cw - 4, "⇅", t.key | curses.A_BOLD)
+            right = x0 + cw - 2
+            if item.link:
+                self.put(y, right, "↗", t.muted_sel if chosen else t.faint)
+                right -= 2
+            if age:
+                attr = (t.stale_sel if chosen else t.stale) | curses.A_BOLD if item.stale else (t.muted_sel if chosen else t.faint)
+                self.put(y, right - len(age) + 1, age, attr)
+            self.hits.append((y, y + len(lines) - 1, x0, x0 + cw, "row", (c, i)))
+            y += len(lines) + 1
+
+    def footer(self, h, w):
+        """The key hints; a recent message (a send that failed, say) comes first so it is always seen."""
+        t, x = self.theme, 2
+        if self.flash and time.time() - self.flash_at < FLASH_SECONDS:
+            self.put(h - 1, x, self.flash, t.done | curses.A_BOLD)
+            x += board.cells(self.flash) + 4
+        for key, label in KEYS:
+            if x + board.cells(key) + len(label) + 2 > w - 2:
+                break
+            self.put(h - 1, x, key, t.key | curses.A_BOLD)
+            self.put(h - 1, x + board.cells(key) + 1, label, t.muted)
+            x += board.cells(key) + len(label) + 4
+
+    def box(self, y, x, hgt, wid, title=""):
+        """A rounded panel; returns its top-left corner and width after clamping to the screen."""
+        t = self.theme
+        h, w = self.s.getmaxyx()
+        hgt, wid = min(hgt, h - 1), min(wid, w - 2)
+        y, x = max(0, min(y, h - hgt - 1)), max(0, min(x, w - wid - 2))
+        for r in range(hgt):
+            self.put(y + r, x, " " * wid, t.panel)
+        self.put(y, x, "╭" + "─" * (wid - 2) + "╮", t.panel_muted)
+        for r in range(1, hgt - 1):
+            self.put(y + r, x, "│", t.panel_muted)
+            self.put(y + r, x + wid - 1, "│", t.panel_muted)
+        self.put(y + hgt - 1, x, "╰" + "─" * (wid - 2) + "╯", t.panel_muted)
+        if title:
+            self.put(y, x + 2, f" {title} ", t.panel | curses.A_BOLD)
+        self.hits.append((y, y + hgt - 1, x, x + wid, "panel", None))
+        return y, x, wid
+
+    def draw_menu(self):
+        """Entries under small group headings, each with its shortcut on the right."""
+        t, m = self.theme, self.menu
+        entries = m["entries"]
+        lines, last = [], None
+        for i, (label, _, _, group, key) in enumerate(entries):
+            if group != last:
+                lines.append(("group", group))
+                last = group
+            lines.append(("entry", i))
+        title = board.clip(m["title"], 40)
+        wid = max(max(board.cells(e[0]) + len(e[4]) + 10 for e in entries), board.cells(title) + 6, 28)
+        y, x, wid = self.box(m["y"], m["x"], len(lines) + 2, wid, title)
+        for row, line in enumerate(lines, y + 1):
+            if line[0] == "group":
+                self.put(row, x + 2, line[1].upper(), t.panel_muted | curses.A_BOLD)
+                continue
+            i = line[1]
+            label, _, _, _, key = entries[i]
+            chosen = i == m["sel"]
+            self.put(row, x + 1, f"   {label}".ljust(wid - 2), t.panel_sel | curses.A_BOLD if chosen else t.panel)
+            if key:
+                self.put(row, x + wid - len(key) - 3, key, t.panel_sel if chosen else t.panel_muted)
+            self.hits.append((row, row, x + 1, x + wid - 1, "menu", i))
+
+    def settings_panel(self, h, w):
+        """Groups of settings: labels on the left, each value in a pill on the right."""
+        t = self.theme
+        values = []
+        for _, key, _, choices, fmt in board.EDITABLE:
+            if choices is None:  # an action, such as Reset: no value to show
+                continue
+            options = choices() if callable(choices) else choices
+            values += [board.setting_text(key, fmt, v) for v in options] + [board.setting_text(key, fmt, self.cfg.get(key, ""))]
+        pill_w = max(board.cells(v) for v in values) + 6
+        label_w = max(board.cells(e[2]) for e in board.EDITABLE)
+        info = [("Projects root", str(board.resolve_root(self.cfg))),
+                ("Colours in use", self.theme.name),
+                ("Settings file", str(Path(self.config_dir) / "config.toml") if self.config_dir else "only inside herdr")]
+        info_w = max(board.cells(k) for k, _ in info)
+        groups = len({e[0] for e in board.EDITABLE})
+        hint = "↑↓ choose · ←→ or click change · Esc close"
+        wid = min(w - 4, max(label_w + pill_w + 12, info_w + max(board.cells(v) for _, v in info) + 10, board.cells(hint) + 8))
+        hgt = len(board.EDITABLE) + groups * 2 + len(info) + 5
+        y, x, wid = self.box((h - hgt) // 2, (w - wid) // 2, hgt, wid, "Settings")
+        row, last = y + 1, None
+        for i, (group, key, label, choices, fmt) in enumerate(board.EDITABLE):
+            if group != last:
+                row += 1
+                self.put(row, x + 3, group.upper(), t.panel_muted | curses.A_BOLD)
+                row += 1
+                last = group
+            chosen = i == self.settings
+            self.put(row, x + 5, label, t.panel | (curses.A_BOLD if chosen else 0))
+            text = "Reset ⏎" if choices is None else board.setting_text(key, fmt, self.cfg[key])
+            pill = f" {text} " if choices is None else f" ‹ {text} › "
+            self.put(row, x + wid - board.cells(pill) - 3, pill, t.panel_sel | curses.A_BOLD if chosen else t.panel_muted)
+            self.hits.append((row, row, x + 1, x + wid - 1, "setting", i))
+            row += 1
+        row += 1
+        for label, value in info:
+            self.put(row, x + 3, label, t.panel_muted)
+            self.put(row, x + 3 + info_w + 3, board.clip(value, wid - info_w - 10), t.panel_muted)
+            row += 1
+        self.put(y + hgt - 2, x + 3, hint, t.panel_muted)
+
+    def review_panel(self, h, w):
+        t = self.theme
+        wid = min(w - 4, 100)
+        inner = wid - 8
+        blocks = []
+        for pr in self.projects:
+            moves = [m for m in self.pending() if m["project"] == pr.slug]
+            if moves:
+                blocks.append((f"{pr.name} coordinator: {len(moves)} move{'s' if len(moves) != 1 else ''}",
+                               board.wrap(board.move_sentence(moves), inner, 8)))
+        if not blocks:
+            self.review = None
+            return
+        hgt = sum(len(lines) + 2 for _, lines in blocks) + 4
+        y, x, wid = self.box((h - hgt) // 2, (w - wid) // 2, hgt, wid, "Pending moves")
+        row = y + 2
+        for title, lines in blocks:
+            self.put(row, x + 3, title, t.panel | curses.A_BOLD)
+            row += 1
+            for line in lines:
+                self.put(row, x + 5, line, t.panel_muted)
+                row += 1
+            row += 1
+        if self.review == "discard?":
+            n = len(self.pending())
+            self.put(y + hgt - 2, x + 3, f"Discard all {n} pending move{'s' if n != 1 else ''}? y discards · n keeps them",
+                     t.panel | curses.A_BOLD)
+        else:
+            self.put(y + hgt - 2, x + 3, "Enter send all · Backspace discard all · Esc close", t.panel_muted)
+
+    def help_panel(self, h, w):
+        """The keys and what the columns mean, in groups; two columns side by side when one is too tall."""
+        t = self.theme
+        groups, current = [], None
+        for key, text in HELP:
+            if not text:
+                current = (key, [])
+                groups.append(current)
+            else:
+                current[1].append((key, text))
+        keyw = max(board.cells(k) for _, rows in groups for k, _ in rows) + 3
+        textw = max(board.cells(text) for _, rows in groups for _, text in rows)
+
+        def lay(colw):
+            """Each group as lines of (kind, key, text) for a column colw cells wide."""
+            out = []
+            for title, rows in groups:
+                lines = [("head", title.upper(), "")]
+                for key, text in rows:
+                    for n, part in enumerate(board.wrap(text, colw - keyw - 2, 3)):
+                        lines.append(("row", key if n == 0 else "", part))
+                out.append(lines + [("gap", "", "")])
+            return out
+
+        one = min(w - 8, keyw + textw + 4)
+        laid = lay(one)
+        height = sum(len(g) for g in laid)
+        cols = 2 if height + 4 > h - 2 and w >= 2 * (keyw + 34) + 10 else 1
+        colw = one if cols == 1 else min((w - 10) // 2, keyw + textw + 4)
+        laid = lay(colw)
+        columns = [laid]
+        if cols == 2:  # split between groups, as evenly as the groups allow
+            total, run, split = sum(len(g) for g in laid), 0, len(laid)
+            for i, g in enumerate(laid):
+                run += len(g)
+                if run >= total / 2:
+                    split = i + 1
+                    break
+            columns = [laid[:split], laid[split:]]
+        flat = [[line for group in column for line in group][:-1] for column in columns]  # no gap at the end
+        tallest = max(len(c) for c in flat)
+        wid = cols * colw + (cols - 1) * 3 + 6
+        hgt = min(h - 1, tallest + 4)
+        room = hgt - 4
+        self.help = max(0, min(self.help, tallest - room))  # the scroll position
+        y, x, wid = self.box(max(0, (h - hgt) // 2), (w - wid) // 2, hgt, wid, "Keys and columns")
+        for ci, lines in enumerate(flat):
+            cx = x + 3 + ci * (colw + 3)
+            for row, (kind, key, text) in enumerate(lines[self.help:self.help + room], y + 2):
+                if kind == "head":
+                    self.put(row, cx, key, t.panel_muted | curses.A_BOLD)
+                elif kind == "row":
+                    self.put(row, cx + 2, key, t.panel | curses.A_BOLD)
+                    self.put(row, cx + 2 + keyw, board.clip(text, colw - keyw - 2), t.panel)
+        hint = "↑↓ scroll · Esc or ? closes" if tallest > room else "Esc or ? closes"
+        if self.help + room < tallest:
+            self.put(y + hgt - 2, x + 3, "↓ more", t.panel_muted)
+        self.put(y + hgt - 2, x + wid - board.cells(hint) - 4, hint, t.panel_muted)
+
+    def prompt_panel(self, h, w):
+        t, p = self.theme, self.prompt
+        if p["mode"] == "search":
+            self.put(h - 2, 2, " / ", t.panel_sel | curses.A_BOLD)
+            self.put(h - 2, 6, p["text"] + "▏", curses.A_BOLD)
+            self.put(h - 2, 8 + board.cells(p["text"]), "type to filter · Enter keep · Esc clear", t.faint)
+            return
+        wid = min(w - 4, 96)
+        inner = wid - 6
+        if p["mode"] == "answer":
+            runs = [(board.answer_sentence(p["item"], ""), "fixed"), (p["text"], "typed")]
+            hint = "type your answer · Enter send · Esc cancel"
+        else:
+            runs = [(board.task_sentence(p["verb"], p["item"]), "fixed")]
+            if p["text"]:
+                runs += [("Note:", "fixed"), (p["text"], "typed")]
+            hint = "Enter send · type to add a note · Esc cancel"
+        lines = board.wrap_runs(runs, inner - 1)
+        about = board.wrap(p["item"].shown(), inner, 2)
+        room = max(3, h - 12 - len(about))
+        shown = lines[-room:]  # long text keeps the end, where you type, in view
+        hgt = len(about) + len(shown) + 7
+        y, x, wid = self.box(h - hgt - 2, (w - wid) // 2, hgt, wid, p["title"])
+        row = y + 2
+        for line in about:
+            self.put(row, x + 3, line, t.panel_muted)
+            row += 1
+        row += 1
+        self.put(row, x + 3, "Sent to the coordinator as:", t.panel_muted)
+        row += 1
+        for n, line in enumerate(shown):
+            col = x + 3
+            for word, style in line:
+                self.put(row, col, word, t.panel | curses.A_BOLD if style == "typed" else t.panel_muted)
+                col += board.cells(word)
+            if n == len(shown) - 1:
+                self.put(row, col + (1 if p["text"].endswith(" ") or not p["text"] else 0), "▏", t.panel | curses.A_BOLD)
+            row += 1
+        self.put(y + hgt - 2, x + 3, hint, t.panel_muted)
+
+    # input -----------------------------------------------------------------
+    def hit(self, y, x):
+        for y0, y1, x0, x1, kind, value in reversed(self.hits):
+            if y0 <= y <= y1 and x0 <= x < x1:
+                return kind, value
+        return None, None
+
+    def read_escape(self):
+        """The rest of an escape sequence curses did not recognise, or '' for a plain Esc key."""
+        self.s.nodelay(True)
+        seq = ""
+        while len(seq) < 32:
+            try:
+                ch = self.s.get_wch()
+            except curses.error:
+                break
+            seq += ch if isinstance(ch, str) else ""
+            if seq.startswith("[<") and seq[-1:] in ("M", "m") or seq in (PASTE_START, PASTE_END):
+                break
+        self.s.nodelay(False)
+        self.s.timeout(TICK_MS)
+        return seq
+
+    def escape(self):
+        """A plain Esc closes whatever is on top, else clears the search, else closes the board."""
+        if self.moving:
+            self.put_back()
+        elif self.review == "discard?":
+            self.review = "open"
+        elif self.review:
+            self.review = None
+        elif self.prompt:
+            if self.prompt["mode"] == "search":
+                self.query = ""
+                self.rebuild()
+            self.prompt = None
+        elif self.menu or self.settings is not None or self.help is not None:
+            self.menu, self.settings, self.help = None, None, None
+        elif self.query:
+            self.query = ""
+            self.rebuild()
+        else:
+            return "quit"
+        return None
+
+    def mouse(self, b, x, y):
+        """One mouse press, handled by whatever is on top."""
+        kind, value = self.hit(y, x)
+        for layer in (self.mouse_moving, self.mouse_menu, self.mouse_overlays, self.mouse_settings):
+            handled, result = layer(b, kind, value)
+            if handled:
+                return result
+        return self.mouse_board(b, x, y, kind, value)
+
+    def mouse_moving(self, b, kind, value):
+        if not self.moving:
+            return False, None
+        if b in (WHEEL_UP, WHEEL_DOWN):
+            self.step(-1 if b == WHEEL_UP else 1)
+        elif b == LEFT:
+            self.drop()
+        return True, None
+
+    def mouse_menu(self, b, kind, value):
+        """A menu takes the next click: run an entry, or close when clicked elsewhere."""
+        if not self.menu:
+            return False, None
+        m, self.menu = self.menu, None
+        if b == LEFT and kind == "menu":
+            return True, self.act(*m["entries"][value][1:3], item=m["item"])
+        return True, None
+
+    def mouse_overlays(self, b, kind, value):
+        if self.help is not None and b in (WHEEL_UP, WHEEL_DOWN):
+            self.help += -1 if b == WHEEL_UP else 1
+            return True, None
+        if self.review or self.prompt or self.help is not None:
+            if b == LEFT and kind != "panel":
+                self.review, self.prompt, self.help = None, None, None
+            return True, None
+        return False, None
+
+    def mouse_settings(self, b, kind, value):
+        if self.settings is None:
+            return False, None
+        if b == LEFT and kind == "setting":
+            self.settings = value
+            self.change_setting(value, 1)
+        elif b == LEFT and kind != "panel":
+            self.settings = None
+        return True, None
+
+    def mouse_board(self, b, x, y, kind, value):
+        if b in (WHEEL_UP, WHEEL_DOWN):
+            if kind in ("row", "section"):
+                self.col = value[0]
+            elif kind in ("col", "colhead"):
+                self.col = value
+            self.move(drow=-1 if b == WHEEL_UP else 1)
+        elif b == RIGHT:
+            if kind == "row":
+                self.col, self.row = value
+                self.open_menu(y, x, self.selected())
+            elif kind == "tab":
+                self.switch(to=value)
+                self.open_menu(y + 1, x, None)
+            else:
+                self.open_menu(y, x, None)
+        elif b == LEFT:
+            if kind == "review":
+                self.review = "open"
+            elif kind == "gear":
+                self.settings = 0
+            elif kind == "tab":
+                self.switch(to=value)
+            elif kind == "col":
+                self.col, self.row = value, 0
+            elif kind == "colhead":
+                self.col = value
+                self.fold_column(value)
+            elif kind == "section":
+                self.col, self.row = value
+                self.fold_section(self.current_row()[1])
+            elif kind == "row":
+                if (self.col, self.row) == value and self.selected() and self.selected().link:
+                    return self.act("link", self.selected().link)  # a click on the selected card opens its PR
+                self.col, self.row = value
+        return None
+
+    def more_input(self):
+        """Whether another key is already waiting: Enter in the middle of fast input is part of a paste."""
+        self.s.nodelay(True)
+        try:
+            ch = self.s.get_wch()
+        except curses.error:
+            return False
+        finally:
+            self.s.nodelay(False)
+            self.s.timeout(TICK_MS)
+        self.unget(ch)
+        return True
+
+    def unget(self, ch):
+        curses.unget_wch(ch)
+
+    def typing(self, ch):
+        """Keys while a search, an answer or a note is being typed. A line break in pasted text is a space."""
+        p = self.prompt
+        if ch in ENTER and (self.pasting or self.more_input()):
+            ch = " "
+        if ch in ENTER:
+            if p["mode"] == "search":
+                self.prompt = None
+            elif p["mode"] == "action" or p["text"].strip():
+                return self.send()
+            return None
+        if ch in BACKSPACE:
+            p["text"] = p["text"][:-1]
+        elif ch == "\x15":  # Ctrl-U
+            p["text"] = ""
+        elif isinstance(ch, str) and ch.isprintable():
+            p["text"] += ch
+        if p["mode"] == "search":
+            self.query = p["text"]
+            self.rebuild()
+            self.first_item()  # the first match
+        return None
+
+    def key(self, ch):
+        """One key press, handled by whatever is on top; returns a command for main to run after the board
+        closes, 'quit', or None. Pasted text only ever reaches a text box, never the board's keys."""
+        if self.pasting and not self.prompt:
+            return None
+        for layer in (self.key_moving, self.key_review, self.key_prompt, self.key_help, self.key_menu, self.key_settings):
+            handled, result = layer(ch)
+            if handled:
+                return result
+        return self.key_board(ch)
+
+    def key_moving(self, ch):
+        if not self.moving:
+            return False, None
+        if ch in (curses.KEY_UP, "k"):
+            self.step(-1)
+        elif ch in (curses.KEY_DOWN, "j"):
+            self.step(1)
+        elif ch == " " or ch in ENTER:
+            self.drop()
+        return True, None
+
+    def key_review(self, ch):
+        if not self.review:
+            return False, None
+        if self.review == "discard?":
+            if ch in ("y", "Y"):
+                self.discard_moves()
+            elif ch in ("n", "N", "q"):
+                self.review = "open"
+            return True, None
+        if ch in ENTER:
+            return True, self.send_moves()
+        if ch in BACKSPACE or ch == curses.KEY_DC:
+            self.review = "discard?"
+        elif ch in ("q", "P"):
+            self.review = None
+        return True, None
+
+    def key_prompt(self, ch):
+        if not self.prompt:
+            return False, None
+        return True, self.typing(ch)
+
+    def key_help(self, ch):
+        if self.help is None:
+            return False, None
+        if ch in ("?", "q"):
+            self.help = None
+        elif ch in (curses.KEY_DOWN, "j"):
+            self.help += 1
+        elif ch in (curses.KEY_UP, "k"):
+            self.help = max(0, self.help - 1)
+        return True, None
+
+    def key_menu(self, ch):
+        if not self.menu:
+            return False, None
+        m = self.menu
+        if ch in (curses.KEY_DOWN, "j"):
+            m["sel"] = (m["sel"] + 1) % len(m["entries"])
+        elif ch in (curses.KEY_UP, "k"):
+            m["sel"] = (m["sel"] - 1) % len(m["entries"])
+        elif ch in ENTER:
+            self.menu = None
+            return True, self.act(*m["entries"][m["sel"]][1:3], item=m["item"])
+        elif ch in ("q", "m"):
+            self.menu = None
+        return True, None
+
+    def key_settings(self, ch):
+        if self.settings is None:
+            return False, None
+        if ch in (curses.KEY_DOWN, "j"):
+            self.settings = (self.settings + 1) % len(board.EDITABLE)
+        elif ch in (curses.KEY_UP, "k"):
+            self.settings = (self.settings - 1) % len(board.EDITABLE)
+        elif ch in (curses.KEY_RIGHT, "l") or ch in ENTER:
+            self.change_setting(self.settings, 1)
+        elif ch in (curses.KEY_LEFT, "h"):
+            self.change_setting(self.settings, -1)
+        elif ch in ("q", "s"):
+            self.settings = None
+        return True, None
+
+    def key_board(self, ch):
+        item, row = self.selected(), self.current_row()
+        if ch == "q":
+            return "quit"
+        if ch == "\t":
+            self.switch(1)
+        elif ch == curses.KEY_BTAB:
+            self.switch(-1)
+        elif isinstance(ch, str) and ch in "123456789":
+            if int(ch) - 1 <= len(self.projects):
+                self.switch(to=int(ch) - 1)
+        elif ch in (curses.KEY_RIGHT, "l"):
+            self.move(dcol=1)
+        elif ch in (curses.KEY_LEFT, "h"):
+            self.move(dcol=-1)
+        elif ch in (curses.KEY_DOWN, "j"):
+            self.move(drow=1)
+        elif ch in (curses.KEY_UP, "k"):
+            self.move(drow=-1)
+        elif ch == "/":
+            self.prompt = {"mode": "search", "text": self.query}
+        elif ch == "?":
+            self.help = 0
+        elif ch == "r":
+            self.start_refresh(announce=True)
+            self.say("Refreshing…")
+        elif ch == "s":
+            self.settings = 0
+        elif ch == "f":
+            self.fold_current()
+        elif ch == "F":
+            self.fold_all()
+        elif ch == "c":
+            self.fold_column()
+        elif ch == " ":
+            self.pick_up()
+        elif ch == "P":
+            if self.pending():
+                self.review = "open"
+            else:
+                self.say("No moves pending")
+        elif ch == "m":
+            y, x = self.card_position() if item else (1, 4)
+            self.open_menu(y, x, item)
+        elif ch in ENTER:
+            if self.column_folded(self.col):
+                self.fold_column()
+            elif row and row[0] == "section":
+                self.fold_section(row[1])
+            elif item and item.link:
+                return self.act("link", item.link)
+            else:
+                self.say("No pull request on this card: try g or the menu")
+        elif ch == "g" and item:
+            return self.act(*board.go_to(self.project_of(item), item)[1:3])
+        elif ch == "g" and self.tab:
+            return self.act("hp", ["open", self.projects[self.tab - 1].slug])
+        elif ch == "a" and item:
+            self.ask_answer(item)
+        elif isinstance(ch, str) and ch in TASK_VERBS:
+            self.ask_action(item, TASK_VERBS[ch])
+        elif ch == "t":
+            pr = self.project_of(item) if item else (self.projects[self.tab - 1] if self.tab else None)
+            if pr:
+                return self.act("hp", ["open-file", str(pr.path / "TASKS.md")])
+        return None
+
+    def run(self):
+        try:
+            return self.loop()
+        finally:
+            if self.theme:
+                self.theme.restore()
+
+    def loop(self):
+        try:
+            curses.curs_set(0)
+        except curses.error:  # terminals that cannot hide the cursor
+            pass
+        self.theme = Theme(self.cfg["palette"])
+        sys.stdout.write(MOUSE_ON + PASTE_ON)
+        sys.stdout.flush()
+        self.refresh_data()
+        self.first_item()
+        self.next_refresh = time.time() + self.cfg["refresh_seconds"]
+        self.s.timeout(TICK_MS)
+        while True:
+            self.take_results()
+            if time.time() >= self.next_refresh and not self.busy():
+                self.start_refresh()
+                self.next_refresh = time.time() + self.cfg["refresh_seconds"]
+            self.draw()
+            try:
+                ch = self.s.get_wch()
+            except curses.error:  # no key this tick
+                continue
+            result = None
+            if ch == "\x1b":
+                seq = self.read_escape()
+                event = parse_sgr(seq)
+                if seq == PASTE_START:
+                    self.pasting = True
+                elif seq == PASTE_END:
+                    self.pasting = False
+                elif event:
+                    result = self.mouse(*event)
+                elif not seq:
+                    result = self.escape()
+            elif ch == curses.KEY_RESIZE:
+                continue
+            else:
+                result = self.key(ch)
+            if result == "quit":
+                return None
+            if result:
+                return result
+
+
+def once(cfg, slug=None):
+    try:
+        projects, _, _ = board.load_all(cfg)
+    except Exception as e:
+        sys.exit(f"projects board: {e}")
+    views = [board.all_projects(projects)] + projects if not slug else [p for p in projects if p.slug == slug]
+    if not views:
+        sys.exit(f"no active project called {slug}")
+    print("\n\n".join(board.as_text(v) for v in views))
+
+
+def main():
+    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+    state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR") or config_dir
+    cfg = board.load_config(config_dir)
+    if "--open" in sys.argv:
+        open_popup()
+        return
+    if "--once" in sys.argv:
+        rest = sys.argv[sys.argv.index("--once") + 1:]
+        once(cfg, rest[0] if rest else None)
+        return
+    os.environ.setdefault("ESCDELAY", "25")  # Esc closes at once instead of after curses' 1 s wait
+    try:
+        after = curses.wrapper(lambda screen: Board(screen, cfg, config_dir, state_dir).run())
+    finally:
+        sys.stdout.write(MOUSE_OFF + PASTE_OFF)
+        sys.stdout.flush()
+    # herdr and herdr-projects commands run after the board closes, so their panes and tabs take focus.
+    if after:
+        kind, args = after
+        editor = cfg.get("editor") or ""
+        if args[0] == "open-file" and editor in board.GUI_EDITORS:
+            subprocess.run([editor, args[1]], check=False)  # a GUI editor opens its own window
+            return
+        if kind == "herdr":
+            command = [os.environ.get("HERDR_BIN_PATH", "herdr"), *args]
+        else:  # herdr-projects, in the board's own projects root
+            command = [board.find_bin(cfg), "--root", str(board.resolve_root(cfg)), *args]
+        env = dict(os.environ, EDITOR=editor) if args[0] == "open-file" and editor else None
+        subprocess.run(command, check=False, env=env)
+
+
+if __name__ == "__main__":
+    main()

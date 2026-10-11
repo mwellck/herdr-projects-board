@@ -1,0 +1,20 @@
+id = "herdr-projects-board"
+name = "Projects board"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "A kanban popup for herdr-projects: every project at a glance, what needs you, to do, in progress, in review and shipped"
+platforms = ["linux", "macos"]
+
+[[actions]]
+id = "open"
+title = "Projects board: open"
+contexts = ["global"]
+command = ["python3", "bin/board", "--open"]
+
+[[panes]]
+id = "board"
+title = "Projects board"
+placement = "popup"
+width = "90%"
+height = "85%"
+command = ["python3", "bin/board"]
