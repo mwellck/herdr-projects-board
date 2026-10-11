@@ -48,7 +48,7 @@ PANE = ("$ git log --oneline -3\n"  # what the website workspace's pane shows: m
         "$ npm run dev\n\n  ready on http://localhost:3000\n")
 WORKSPACES = {"website": "website", "mobile": "mobile-app", "api": "api"}  # demo project slug: herdr workspace
 AGENT_STATE = {"working": "working", "waiting-on-you": "blocked", "ready-for-review": "idle"}  # resolved: no pane
-CAPTIONS = ["Every project, one popup", "Answer a decision", "Reprioritise, then send", "Every action in one menu"]
+CAPTIONS = ["Every project, one popup", "Answer a decision", "Reprioritise, review, send", "Every action in one menu"]
 
 
 def steps():
@@ -58,10 +58,10 @@ def steps():
         (0.3, "prefix:t"), (0.0, "wait:NEEDS YOU"), (0.0, "start"), (0.0, "caption:0"),  # opens on the board over herdr
         (2.2, "still:all-projects"),
         (0.0, "caption:1"), (0.5, "a"), (0.0, "wait:type your answer"), (0.4, "text:A toggle, as recommended"),
-        (1.2, "still:answer"), (0.4, "enter"), (0.0, "wait:Sent"),   # typed text is redrawn letter by letter: no wait
+        (1.2, "still:answer"), (0.4, "tab"), (0.0, "wait:Added"),   # typed text is redrawn letter by letter: no wait
         (0.8, "caption:2"), (0.0, "tab"), (0.4, "tab"),     # Mobile app
         (0.5, "right"), (0.3, "down"), (0.3, "space"), (0.3, "down"), (0.3, "down"), (0.3, "space"),
-        (0.5, "P"), (0.0, "wait:Pending moves"), (1.2, "still:review"), (0.0, "enter"), (0.0, "wait:Sent"),
+        (0.5, "P"), (0.0, "wait:Pending changes"), (1.2, "still:review"), (0.0, "enter"), (0.0, "wait:Sent"),
         (0.8, "caption:3"), (0.0, "4"), (0.5, "m"), (0.0, "wait:TALK TO THE COORDINATOR"), (0.3, "j"), (0.3, "j"),
         (1.2, "still:menu"), (0.6, "esc"), (1.0, ""),   # ends on the board, so the loop never shows an empty herdr
     ]

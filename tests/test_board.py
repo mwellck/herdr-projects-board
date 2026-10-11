@@ -334,6 +334,13 @@ class Moving(unittest.TestCase):
         board.record_move(state, raw, {"project": "p", "text": "a", "section": "Stage 1", "before": "b", "status": "pending"})
         self.assertEqual(state["moves"], [], "a is back above b, as in TASKS.md: nothing to send")
 
+    def test_cancelling_a_move_also_drops_moves_left_with_nothing_to_do(self):
+        raw = self.project()
+        state = dict(board.EMPTY_STATE, moves=[{"project": "p", "text": "a", "section": "Stage 1", "before": None, "status": "pending"},
+                                                {"project": "p", "text": "c", "section": "Stage 2", "before": None, "status": "pending"}])
+        board.cancel_move(state, raw, "a")
+        self.assertEqual([m["text"] for m in state["moves"]], ["c"])
+
     def test_one_sentence_per_project(self):
         one = [{"text": "d", "section": "Stage 1", "before": "b"}]
         self.assertEqual(board.move_sentence(one),
@@ -342,6 +349,54 @@ class Moving(unittest.TestCase):
         self.assertEqual(board.move_sentence(two),
                          '(from the projects board) Please reorder TASKS.md: 1) move the task "d" to just above "b" in the '
                          '"Stage 1" section; 2) move the task "z" to the end of the "Stage 2" section.')
+
+
+class Pending(unittest.TestCase):
+    def test_a_single_change_reads_as_it_would_alone(self):
+        done = {"project": "p", "text": "Rename keys", "kind": "task", "thread": "", "verb": "mark as done", "typed": "in #12"}
+        self.assertEqual(board.batch_sentence([done], []), board.task_sentence("mark as done", board.Item("Rename keys"), "in #12"))
+        move = {"text": "d", "section": "Stage 1", "before": "b"}
+        self.assertEqual(board.batch_sentence([], [move]), board.move_sentence([move]))
+        note = {"project": "p", "text": "Dark mode", "kind": "thread", "thread": "t-0002", "verb": "", "typed": "hold it."}
+        self.assertEqual(board.batch_sentence([done, note], [move]),
+                         '(from the projects board) Please go through these in order: '
+                         '1) Please mark as done the task "Rename keys" in TASKS.md. Note: in #12; '
+                         '2) About thread t-0002 "Dark mode": hold it; '
+                         '3) Please move the task "d" to just above "b" in the "Stage 1" section of TASKS.md.')
+
+    def test_actions_mark_their_card_and_go_with_it(self):
+        pr = board.Project("p", "P", Path("/p"))
+        pr.columns["To do"] = [board.Item("a", "task", "S", group="S", project="p")]
+        pr.columns["In progress"] = [board.Item("t", "thread", thread="t-0001", project="p")]
+        state = dict(board.EMPTY_STATE, actions=[
+            {"project": "p", "text": "a", "kind": "task", "thread": "", "verb": "drop", "typed": ""},
+            {"project": "p", "text": "t", "kind": "thread", "thread": "t-0001", "verb": "", "typed": "hi"},
+            {"project": "p", "text": "gone", "kind": "task", "thread": "", "verb": "drop", "typed": ""},
+            {"project": "q", "text": "other project", "kind": "task", "thread": "", "verb": "drop", "typed": ""}])
+        shown = board.arrange(pr, state)
+        self.assertEqual((shown.columns["To do"][0].pending, shown.columns["In progress"][0].pending), ("drop", "message"))
+        self.assertEqual([a["text"] for a in state["actions"]], ["a", "t", "other project"], "a card that is gone takes its action")
+
+    def test_a_new_action_replaces_the_cards_earlier_one(self):
+        state = dict(board.EMPTY_STATE, moves=[{"project": "p", "text": "a", "section": "S", "before": None, "status": "pending"}])
+        state["actions"] = []
+        note = {"project": "p", "text": "a", "kind": "task", "thread": "", "verb": "", "typed": "hi"}
+        board.record_action(state, note)
+        self.assertEqual(len(state["moves"]), 1, "a message keeps the move")
+        board.record_action(state, dict(note, verb="drop", typed=""))
+        self.assertEqual([board.pending_label(a) for a in state["actions"]], ["drop"])
+        self.assertEqual(state["moves"], [], "a dropped task's move is moot")
+        board.record_action(state, dict(note, verb="delegate"), queue=False)
+        self.assertEqual(state["actions"], [], "sent at once: it replaces the pending one")
+
+    def test_the_menu_offers_to_cancel(self):
+        pr = board.Project("p", "P", Path("/nonexistent"))
+        acts = {a[0]: a for a in board.actions_for(pr, board.Item("a", "task", "S", group="S", pending="done"))}
+        self.assertEqual(acts["Cancel pending: done"][1:], ("cancel", None, "Pending", "⌫"))
+        acts = {a[0] for a in board.actions_for(pr, board.Item("a", "task", "S", group="S", moved="pending"))}
+        self.assertIn("Cancel pending: move", acts)
+        acts = {a[0] for a in board.actions_for(pr, board.Item("a", "task", "S", group="S", moved="sent"))}
+        self.assertFalse(any(a.startswith("Cancel") for a in acts), "a sent move is the coordinator's now")
 
 
 class Loading(unittest.TestCase):
@@ -694,13 +749,96 @@ class Interactive(unittest.TestCase):
         b = self.board()
         self.select(b, "alpha", "Rename settings keys")
         b.pick_up(); b.step(1); b.drop()
+        b.key("x"); b.key("\t")
         b.review = "open"
-        b.key("\x7f")
-        self.assertEqual(len(b.pending()), 1, "Backspace only asks")
+        b.key("X")
+        self.assertEqual(len(b.changes()), 1, "X only asks")
         b.key("n")
-        self.assertEqual((b.review, len(b.pending())), ("open", 1))
-        b.key("\x7f"); b.key("y")
+        self.assertEqual((b.review, len(b.changes())), ("open", 1))
+        b.key("X"); b.key("y")
+        self.assertEqual((b.pending(), b.state["actions"]), ([], []))
+
+    def test_tab_adds_to_pending_and_p_sends_one_sentence_per_project(self):
+        b = self.board()
+        self.select(b, "alpha", "Pick a database. Recommendation: Postgres")
+        b.key("a")
+        b.key("\t")
+        self.assertEqual(b.state["actions"], [], "an empty answer is not added")
+        for ch in "Postgres":
+            b.key(ch)
+        b.key("\t")
+        self.select(b, "alpha", "Look into Safari logouts")
+        b.key("x"); b.key("\t")
+        self.select(b, "beta", "Look into Safari logouts")
+        b.key("D"); b.key("\t")
+        self.assertEqual(self.sent, [], "Tab never sends")
+        self.assertEqual(b.selected().pending, "drop")
+        self.assertEqual(b.card_label(b.selected()), "drop · pending")
+        b.key("P")
+        self.assertEqual(len(b.changes()), 3)
+        b.key("\n")
+        self.assertEqual([s for s, _ in self.sent], ["alpha", "beta"])
+        self.assertEqual(self.sent[0][1], '(from the projects board) Please go through these in order: '
+                         '1) My answer to the decision "Pick a database. Recommendation: Postgres" in TASKS.md: Postgres; '
+                         '2) Please mark as done the task "Look into Safari logouts" in TASKS.md.')
+        self.assertEqual(self.sent[1][1], '(from the projects board) Please drop the task "Look into Safari logouts" in TASKS.md.')
+        self.assertEqual(b.state["actions"], [])
+
+    def test_backspace_cancels_the_cards_action_then_its_move(self):
+        b = self.board()
+        self.select(b, "alpha", "Rename settings keys")
+        b.pick_up(); b.step(1); b.drop()
+        b.key("a")
+        for ch in "after the beta":
+            b.key(ch)
+        b.key("\t")
+        self.assertEqual(b.card_label(b.selected()), "moved · pending · message · pending")
+        b.key("a")
+        self.assertEqual(b.prompt["text"], "after the beta", "reopening the box edits what was typed")
+        b.escape()
+        b.key("\x7f")
+        self.assertEqual((b.state["actions"], len(b.pending())), ([], 1), "the action goes first")
+        b.key("\x7f")
         self.assertEqual(b.pending(), [])
+        self.assertEqual(b.selected().moved, "")
+        b.key("\x7f")
+        self.assertIn("Nothing pending", b.flash)
+
+    def test_done_replaces_the_move_and_blocks_moving(self):
+        b = self.board()
+        self.select(b, "alpha", "Rename settings keys")
+        b.pick_up(); b.step(1); b.drop()
+        b.key("x"); b.key("\t")
+        self.assertEqual((b.pending(), b.selected().pending), ([], "done"), "a done task's move is moot")
+        b.pick_up()
+        self.assertIsNone(b.moving)
+        self.assertIn("Backspace cancels it", b.flash)
+
+    def test_sending_now_clears_the_cards_pending_action(self):
+        b = self.board()
+        self.select(b, "alpha", "Rename settings keys")
+        b.key("x"); b.key("\t")
+        b.key("d"); b.key("\n")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(b.state["actions"], [])
+
+    def test_backspace_in_the_review_cancels_the_selected_change(self):
+        b = self.board()
+        self.plain_theme(b)
+        for text in ("Rename settings keys", "Look into Safari logouts"):
+            self.select(b, "alpha", text)
+            b.key("x"); b.key("\t")
+        self.select(b, "alpha", "One more task")
+        b.pick_up(); b.step(-1); b.drop()
+        b.key("P")
+        b.draw()
+        b.key("j"); b.key("\x7f")
+        self.assertEqual([a["text"] for a in b.state["actions"]], ["Rename settings keys"])
+        self.assertEqual(len(b.pending()), 1)
+        b.key("j"); b.key("\x7f")
+        self.assertEqual((b.review, len(b.pending())), ("open", 0), "the last line was selected: the move")
+        b.key("\x7f")
+        self.assertIsNone(b.review, "nothing left: the review closes")
 
     def test_close_after_send(self):
         b = self.board(close_after_send=True)
